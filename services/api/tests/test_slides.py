@@ -1,0 +1,440 @@
+import base64
+import io
+import os
+import tempfile
+import uuid
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+TEST_DB = Path(tempfile.gettempdir()) / f"waypoint-slides-{uuid.uuid4()}.db"
+os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
+
+from app.database import SessionLocal, engine  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models import AgentRun  # noqa: E402
+
+
+CANNED_SUGGEST = '{"topics": [{"id": "t1", "title": "Attention mechanisms", "rationale": "Natural next step", "related_slides": "Slide 3"}]}'
+CANNED_EXTEND = '{"slides": [{"title": "Attention", "bullets": ["Query-key-value idea", "Scaled dot-product"], "speaker_notes": "Keep it intuitive."}]}'
+
+
+class _FakeSlidesResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+def _fake_slides_client(status: dict):
+    calls: dict = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            calls["auth"] = (headers or {}).get("Authorization")
+            calls["session"] = (json or {}).get("session_id")
+            calls["session_key"] = (headers or {}).get("X-Hermes-Session-Key")
+            calls["input"] = (json or {}).get("input")
+            return _FakeSlidesResponse({"run_id": "run-slides-1"})
+
+        def get(self, url, headers=None):
+            return _FakeSlidesResponse(status)
+
+    return FakeClient, calls
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as test_client:
+        yield test_client
+    engine.dispose()
+    TEST_DB.unlink(missing_ok=True)
+
+
+def test_suggest_uses_gateway_and_writes_nothing(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    from sqlalchemy import func, select
+
+    FakeClient, calls = _fake_slides_client({"status": "completed", "output": CANNED_SUGGEST})
+    monkeypatch.setattr("app.hermes.httpx.Client", FakeClient)
+    db = SessionLocal()
+    before = db.scalar(select(func.count()).select_from(AgentRun))
+    db.close()
+
+    response = client.post(
+        "/api/slides/suggest",
+        headers={"X-Hermes-Api-Key": "k" * 64},
+        json={"source_text": "Transformers intro. Slide 3 covers embeddings.", "count": 3},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["output"] == CANNED_SUGGEST
+    assert calls["auth"] == "Bearer " + "k" * 64
+    assert str(calls["session"]).startswith("slides-suggest-")
+    assert str(calls["session_key"]).startswith("waypoint:slides:")
+    assert "extension topics" in calls["input"]
+
+    db = SessionLocal()
+    after = db.scalar(select(func.count()).select_from(AgentRun))
+    db.close()
+    assert after == before
+
+
+def test_suggest_with_student_injects_learner_context(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    from sqlalchemy import func, select
+
+    FakeClient, calls = _fake_slides_client({"status": "completed", "output": CANNED_SUGGEST})
+    monkeypatch.setattr("app.hermes.httpx.Client", FakeClient)
+
+    student = client.post("/api/students", json={"display_name": "Slides Learner"}).json()
+    db = SessionLocal()
+    before = db.scalar(select(func.count()).select_from(AgentRun))
+    db.close()
+
+    response = client.post(
+        "/api/slides/suggest",
+        headers={"X-Hermes-Api-Key": "k" * 64, "X-Waypoint-User": student["student_id"]},
+        json={"source_text": "Transformers intro.", "count": 3, "student_id": student["student_id"]},
+    )
+    assert response.status_code == 200
+    assert "LEARNER CONTEXT" in calls["input"]
+    assert "source=roadmap" in calls["input"]
+
+    db = SessionLocal()
+    after = db.scalar(select(func.count()).select_from(AgentRun))
+    db.close()
+    assert after == before
+
+
+def test_suggest_unknown_student_falls_back_to_deck_only(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    FakeClient, calls = _fake_slides_client({"status": "completed", "output": CANNED_SUGGEST})
+    monkeypatch.setattr("app.hermes.httpx.Client", FakeClient)
+
+    response = client.post(
+        "/api/slides/suggest",
+        headers={"X-Hermes-Api-Key": "k" * 64},
+        json={"source_text": "Transformers intro.", "count": 3, "student_id": "no-such-student"},
+    )
+    assert response.status_code == 200
+    assert "LEARNER CONTEXT" not in calls["input"]
+
+
+def test_build_learner_context_uses_verified_data_only():
+    from app.slides import build_learner_context_block
+
+    block = build_learner_context_block(
+        {
+            "program": "BSc CS",
+            "discipline": "cs",
+            "year": "Year 2",
+            "stated_facts": [{"category": "goal", "key": "role", "value": "AI engineer"}],
+            "confirmed_evidence": {"project": [{"title": "Vision classifier"}]},
+        },
+        {"snapshot": {"title": "AI Roadmap", "nodes": [{"title": "Transformers", "status": "in-progress"}]}},
+    )
+    assert "AI engineer" in block
+    assert "Vision classifier" in block
+    assert "Transformers [in-progress]" in block
+    assert build_learner_context_block({}, {}) == ""
+    assert build_learner_context_block(None, None) == ""
+
+
+def test_extend_uses_gateway_and_includes_topic(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    FakeClient, calls = _fake_slides_client({"status": "completed", "output": CANNED_EXTEND})
+    monkeypatch.setattr("app.hermes.httpx.Client", FakeClient)
+
+    response = client.post(
+        "/api/slides/extend",
+        headers={"X-Hermes-Api-Key": "k" * 64},
+        json={"source_text": "Transformers intro.", "topic": "Attention mechanisms", "length": "short"},
+    )
+    assert response.status_code == 200
+    assert response.json()["output"] == CANNED_EXTEND
+    assert "Attention mechanisms" in calls["input"]
+    assert "short" in calls["input"]
+
+
+def test_extend_length_hint_is_validated(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    from app.slides import build_extend_input
+
+    assert "2-3" in build_extend_input("src", "topic", "short")
+    assert "7-10" in build_extend_input("src", "topic", "long")
+    with pytest.raises(Exception):
+        from app.slides import run_extend
+        run_extend("src", "topic", "enormous", hermes_api_key="k" * 64)
+
+
+def test_slides_reject_bad_input(client: TestClient):
+    headers = {"X-Hermes-Api-Key": "k" * 64}
+    assert client.post("/api/slides/suggest", headers=headers, json={"source_text": "", "count": 3}).status_code == 422
+    assert client.post("/api/slides/suggest", headers=headers, json={"source_text": "x", "count": 99}).status_code == 422
+    assert client.post("/api/slides/extend", headers=headers, json={"source_text": "x", "topic": "", "length": "short"}).status_code == 422
+    assert client.post("/api/slides/extend", headers=headers, json={"source_text": "x", "topic": "t", "length": "enormous"}).status_code == 422
+    # A stale model sent by an old tab is ignored (the Settings choice is used), so it never 422s.
+    from app.schemas import SlidesSuggestInput
+    assert SlidesSuggestInput(source_text="x", provider="gemini", model="not-a-model").model is None
+
+
+def test_slides_map_gateway_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    FakeClient, _ = _fake_slides_client({"status": "failed", "error": "model exploded"})
+    monkeypatch.setattr("app.hermes.httpx.Client", FakeClient)
+    response = client.post(
+        "/api/slides/extend",
+        headers={"X-Hermes-Api-Key": "k" * 64},
+        json={"source_text": "Slides.", "topic": "More depth", "length": "medium"},
+    )
+    assert response.status_code == 502
+    assert "model exploded" in response.json()["detail"]
+
+
+def test_export_builds_pptx_with_default_theme(client: TestClient):
+    response = client.post(
+        "/api/slides/export",
+        json={
+            "original_filename": "lecture.pdf",
+            "topic": "Attention mechanisms",
+            "slides": [
+                {"title": "Attention", "bullets": ["Query-key-value", "Scaled dot-product"], "speaker_notes": "Keep it intuitive."},
+                {"title": "In practice", "bullets": ["Multi-head", "Masks"]},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/vnd.openxmlformats")
+    assert response.content[:2] == b"PK"
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(response.content))
+    # Divider + 2 new slides (no originals supplied).
+    assert len(prs.slides) == 3
+    titles = [s.shapes.title.text if s.shapes.title is not None else "" for s in prs.slides]
+    assert titles[0].startswith("New:")
+    assert titles[1] == "Attention"
+    assert titles[2] == "In practice"
+
+
+def test_export_keeps_originals_and_matches_styling(client: TestClient):
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Pt
+
+    template_buf = io.BytesIO()
+    template = Presentation()
+    slide = template.slides.add_slide(template.slide_layouts[1])
+    slide.shapes.title.text = "Original"
+    # Distinctive dark background + title styling the new slides must copy.
+    slide.background.fill.solid()
+    slide.background.fill.fore_color.rgb = RGBColor(0x1B, 0x1B, 0x3A)
+    run = slide.shapes.title.text_frame.paragraphs[0].runs[0]
+    run.font.size = Pt(40)
+    run.font.bold = True
+    run.font.color.rgb = RGBColor(0xFF, 0xCC, 0x00)
+    template.save(template_buf)
+    original_b64 = base64.b64encode(template_buf.getvalue()).decode("ascii")
+
+    response = client.post(
+        "/api/slides/export",
+        json={
+            "original_filename": "lecture.pptx",
+            "topic": "Attention",
+            "slides": [{"title": "New idea", "bullets": ["Point one", "Point two"]}],
+            "original_pptx_base64": original_b64,
+        },
+    )
+    assert response.status_code == 200
+    prs = Presentation(io.BytesIO(response.content))
+    # Original + divider + 1 new slide.
+    assert len(prs.slides) == 3
+    assert prs.slides[0].shapes.title.text == "Original"
+    assert prs.slides[1].shapes.title.text.startswith("New:")
+    assert prs.slides[2].shapes.title.text == "New idea"
+    new_bg = prs.slides[2].background.fill.fore_color.rgb
+    assert (new_bg[0], new_bg[1], new_bg[2]) == (0x1B, 0x1B, 0x3A)
+    new_title_run = prs.slides[2].shapes.title.text_frame.paragraphs[0].runs[0]
+    assert new_title_run.font.bold is True
+    assert (new_title_run.font.color.rgb[0], new_title_run.font.color.rgb[1], new_title_run.font.color.rgb[2]) == (0xFF, 0xCC, 0x00)
+
+
+def test_export_embeds_pdf_page_images(client: TestClient):
+    import struct
+    import zlib
+
+    def tiny_png(rgb=(255, 255, 255)):
+        def chunk(tag, data):
+            c = struct.pack(">I", len(data)) + tag + data
+            return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
+        raw = b"".join(b"\x00" + bytes(rgb) * 2 for _ in range(2))
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+    page = "data:image/png;base64," + base64.b64encode(tiny_png()).decode("ascii")
+    response = client.post(
+        "/api/slides/export",
+        json={
+            "original_filename": "lecture.pdf",
+            "topic": "Attention",
+            "slides": [{"title": "New idea", "bullets": ["Point one"]}],
+            "original_images_base64": [page, page],
+        },
+    )
+    assert response.status_code == 200
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(response.content))
+    # 2 page images + divider + 1 new slide.
+    assert len(prs.slides) == 4
+
+
+def test_extend_design_hint_reaches_prompt(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    FakeClient, calls = _fake_slides_client({"status": "completed", "output": CANNED_EXTEND})
+    monkeypatch.setattr("app.hermes.httpx.Client", FakeClient)
+
+    response = client.post(
+        "/api/slides/extend",
+        headers={"X-Hermes-Api-Key": "k" * 64},
+        json={
+            "source_text": "Transformers intro.",
+            "topic": "Attention",
+            "length": "medium",
+            "design_hint": "Dark navy background, gold titles",
+        },
+    )
+    assert response.status_code == 200
+    assert "Dark navy background" in calls["input"]
+
+
+def test_extend_instructions_load_slide_skill_and_layouts():
+    from app.slides import EXTEND_INSTRUCTIONS
+
+    assert "waypoint-slides" in EXTEND_INSTRUCTIONS
+    for layout in ("two-column", "stats", "quote", "takeaway", "steps"):
+        assert layout in EXTEND_INSTRUCTIONS
+
+
+def test_slide_skill_exists_and_covers_layouts():
+    skill = Path(__file__).resolve().parents[3] / ".hermes" / "skills" / "waypoint-slides" / "SKILL.md"
+    assert skill.is_file()
+    text = skill.read_text(encoding="utf-8")
+    for layout in ("two-column", "stats", "quote", "takeaway", "steps"):
+        assert layout in text
+
+
+def test_export_renders_rich_layouts(client: TestClient):
+    response = client.post(
+        "/api/slides/export",
+        json={
+            "original_filename": "lecture.pdf",
+            "topic": "Attention mechanisms",
+            "slides": [
+                {"title": "Why attention", "bullets": ["Long-range links", "Parallel training"], "kicker": "Motivation", "layout": "bullets", "visual": "Diagram: RNN chain vs attention star"},
+                {"title": "How it flows", "bullets": ["Score queries", "Weight values", "Mix output"], "layout": "steps"},
+                {"title": "Heads compared", "bullets": ["Local patterns", "Global patterns"], "layout": "two-column",
+                 "columns": [{"heading": "Local heads", "bullets": ["Syntax nearby"]}, {"heading": "Global heads", "bullets": ["Long links"]}]},
+                {"title": "Attention at scale", "bullets": ["Adoption"], "layout": "stats",
+                 "stats": [{"value": "90%", "label": "Top models use it"}, {"value": "2017", "label": "Transformer year"}]},
+                {"title": "What the paper says", "bullets": ["Attention is all you need"], "layout": "quote", "quote_cite": "Vaswani et al."},
+                {"title": "Attention wins", "bullets": ["Use it where order matters less than relations"], "layout": "takeaway"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(response.content))
+    # Divider + 6 new slides (no originals supplied).
+    assert len(prs.slides) == 7
+    assert prs.slides[2].shapes.title.text == "How it flows"
+    # Steps are numbered, stats show values, quote keeps its cite.
+    step_text = prs.slides[2].placeholders[1].text_frame.text
+    assert "1. " in step_text
+    stats_text = prs.slides[4].placeholders[1].text_frame.text
+    assert "90%" in stats_text and "2017" in stats_text
+    quote_text = prs.slides[5].placeholders[1].text_frame.text
+    assert "Vaswani" in quote_text
+    # The visual idea lands in the speaker notes, not the slide body.
+    assert "Visual:" in prs.slides[1].notes_slide.notes_text_frame.text
+
+
+def test_export_unknown_layout_falls_back_to_bullets(client: TestClient):
+    response = client.post(
+        "/api/slides/export",
+        json={
+            "original_filename": "lecture.pdf",
+            "topic": "Attention",
+            "slides": [{"title": "New idea", "bullets": ["Point one", "Point two"], "layout": "hologram"}],
+        },
+    )
+    assert response.status_code == 200
+    from pptx import Presentation
+
+    prs = Presentation(io.BytesIO(response.content))
+    assert len(prs.slides) == 2
+    assert "Point one" in prs.slides[1].placeholders[1].text_frame.text
+
+
+def test_export_rejects_bad_payload(client: TestClient):
+    assert client.post("/api/slides/export", json={"original_filename": "a.pdf", "topic": "t", "slides": []}).status_code == 422
+    bad = client.post(
+        "/api/slides/export",
+        json={
+            "original_filename": "a.pptx",
+            "topic": "t",
+            "slides": [{"title": "x", "bullets": ["y"]}],
+            "original_pptx_base64": "!!!not-base64!!!",
+        },
+    )
+    assert bad.status_code == 422
+
+
+def test_export_keeps_pdf_page_proportions_and_survives_control_characters(client: TestClient):
+    from PIL import Image
+    from pptx import Presentation
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (300, 400), "white").save(buffer, format="PNG")  # a portrait handout page
+    page = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    response = client.post(
+        "/api/slides/export",
+        json={
+            "original_filename": "handout.pdf",
+            "topic": "Bad\x0btext",
+            "slides": [{"title": "Odd\x00chars", "bullets": ["one\x1f", "two", "three", "four"], "layout": "two-column"}],
+            "original_images_base64": [page],
+            "divider_title": "جديد: الانتباه",
+        },
+    )
+    assert response.status_code == 200
+    prs = Presentation(io.BytesIO(response.content))
+    assert round(prs.slide_width / prs.slide_height, 2) == 0.75
+    picture = next(shape for shape in prs.slides[0].shapes if shape.shape_type == 13)
+    assert round(picture.width / picture.height, 2) == 0.75
+    assert prs.slides[1].shapes.title.text_frame.text == "جديد: الانتباه"
+    texts = " ".join(shape.text_frame.text for shape in prs.slides[2].shapes if shape.has_text_frame)
+    # Two-column without columns splits the bullets like the preview does.
+    assert "one" in texts and "four" in texts and "\x00" not in texts
+
+
+def test_export_reports_a_damaged_original_as_422(client: TestClient):
+    response = client.post(
+        "/api/slides/export",
+        json={"original_filename": "broken.pptx", "topic": "T", "slides": [{"title": "A", "bullets": ["b"]}],
+              "original_pptx_base64": base64.b64encode(b"PK\x03\x04not really a zip").decode("ascii")},
+    )
+    assert response.status_code == 422

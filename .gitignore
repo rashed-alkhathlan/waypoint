@@ -1,0 +1,60 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Personal local runners (not for sharing).
+scripts/firas_*.py
+
+# Environment and local runtime state
+.env
+.env.bak
+.venv
+services/data/
+*.db
+*.db-shm
+*.db-wal
+.hermes-runtime/
+.hermes-email-runtime/
+__pycache__/
+.pytest_cache/
+*.pyc
+.cache/
+.hf-cache/
+*.safetensors
+
+# Brainstorming companion mockups
+.superpowers/
+# Keep old pairing files ignored so upgrades cannot accidentally commit a secret.
+.local-outlook-key
+
+# Real Blackboard exports contain a student's grades (see BB-Extension/.gitignore)
+iau-blackboard-export-*.json
+
+# Blackboard sync sign-in screenshots (local debugging only — may show the username)
+.blackboard-debug/
+data/docker-backup/
+
+# Generated launch-video renders and intermediate frames.
+/brag-output/
+/brag-output-*/

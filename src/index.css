@@ -1,0 +1,541 @@
+@import "tailwindcss";
+
+.bb-floating-toolbar[data-floating="true"] {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+/* `dark:` follows the chosen Waypoint theme, not the operating system: a dark OS with the White
+   theme must not get light-on-white text, and the reverse. Keep in sync with dark themes in lib/themes.ts. */
+@custom-variant dark (&:where([data-theme="vercel-dark"], [data-theme="vercel-dark"] *, [data-theme="nocturne"], [data-theme="nocturne"] *, [data-theme="catppuccin-mocha"], [data-theme="catppuccin-mocha"] *, [data-theme="tokyo-night"], [data-theme="tokyo-night"] *, [data-theme="velvet"], [data-theme="velvet"] *, [data-theme="dracula"], [data-theme="dracula"] *, [data-theme="deep-ocean"], [data-theme="deep-ocean"] *));
+
+:root {
+  --background: #ffffff;
+  --foreground: #09090b;
+  --muted: #f4f4f5;
+  --muted-foreground: #65656f;
+  --border: #e4e4e7;
+  /* 4.8:1 on white; focus rings need at least 3:1. */
+  --ring: #71717a;
+  --primary: #09090b;
+  --primary-foreground: #fafafa;
+  --popover: #f4f4f5;
+  --popover-foreground: #09090b;
+  /* Shared by every theme: computed per element, so they follow each theme's own background. */
+  --card: var(--background);
+  --card-foreground: var(--foreground);
+  --destructive: #dc2626;
+}
+
+[data-theme="vercel-dark"],
+[data-theme="nocturne"],
+[data-theme="catppuccin-mocha"],
+[data-theme="tokyo-night"],
+[data-theme="velvet"],
+[data-theme="dracula"],
+[data-theme="deep-ocean"] {
+  --destructive: #f87171;
+}
+
+[data-theme="vercel-dark"] {
+  --background: #000000;
+  --foreground: #fafafa;
+  --muted: #171717;
+  --muted-foreground: #a1a1aa;
+  --border: #262626;
+  --ring: #525252;
+  --primary: #fafafa;
+  --primary-foreground: #000000;
+  --popover: #171717;
+  --popover-foreground: #fafafa;
+}
+
+[data-theme="fjord"] {
+  --background: #f3f6f8;
+  --foreground: #10222e;
+  --muted: #e3eaf0;
+  --muted-foreground: #5b6e7d;
+  --border: #d2dde6;
+  --ring: #2b7a99;
+  --primary: #10222e;
+  --primary-foreground: #f3f6f8;
+  --popover: #f3f6f8;
+  --popover-foreground: #10222e;
+}
+
+[data-theme="porcelain"] {
+  --background: #faf7f2;
+  --foreground: #1c1917;
+  --muted: #efe8dc;
+  --muted-foreground: #796f65;
+  --border: #e2d8c8;
+  --ring: #c19a5b;
+  --primary: #1c1917;
+  --primary-foreground: #faf7f2;
+  --popover: #faf7f2;
+  --popover-foreground: #1c1917;
+}
+
+[data-theme="nocturne"] {
+  --background: #0f1220;
+  --foreground: #ede8db;
+  --muted: #1b1f33;
+  --muted-foreground: #9b97ad;
+  --border: #2b3048;
+  --ring: #c6a87c;
+  --primary: #d6b98c;
+  --primary-foreground: #0f1220;
+  --popover: #1b1f33;
+  --popover-foreground: #ede8db;
+}
+
+[data-theme="catppuccin-mocha"] {
+  --background: #1e1e2e;
+  --foreground: #cdd6f4;
+  --muted: #313244;
+  --muted-foreground: #a6adc8;
+  --border: #45475a;
+  --ring: #b4befe;
+  --primary: #b4befe;
+  --primary-foreground: #1e1e2e;
+  --popover: #313244;
+  --popover-foreground: #cdd6f4;
+}
+
+[data-theme="tokyo-night"] {
+  --background: #1a1b26;
+  --foreground: #a9b1d6;
+  --muted: #24283b;
+  --muted-foreground: #787c99;
+  --border: #2f354d;
+  --ring: #7aa2f7;
+  --primary: #7aa2f7;
+  --primary-foreground: #1a1b26;
+  --popover: #24283b;
+  --popover-foreground: #a9b1d6;
+}
+
+[data-theme="velvet"] {
+  --background: #22141d;
+  --foreground: #f4e8e2;
+  --muted: #38222f;
+  --muted-foreground: #c2a0ae;
+  --border: #4f3145;
+  --ring: #d68ba0;
+  --primary: #d68ba0;
+  --primary-foreground: #22141d;
+  --popover: #38222f;
+  --popover-foreground: #f4e8e2;
+}
+
+[data-theme="dracula"] {
+  --background: #282a36;
+  --foreground: #f8f8f2;
+  --muted: #44475a;
+  --muted-foreground: #9a9ec1;
+  --border: #44475a;
+  --ring: #bd93f9;
+  --primary: #bd93f9;
+  --primary-foreground: #282a36;
+  --popover: #44475a;
+  --popover-foreground: #f8f8f2;
+}
+
+[data-theme="sage"] {
+  --background: #f5f7f2;
+  --foreground: #182b21;
+  --muted: #e6ece1;
+  --muted-foreground: #536858;
+  --border: #cdd9c8;
+  --ring: #34704c;
+  --primary: #285c3e;
+  --primary-foreground: #ffffff;
+  --popover: #e6ece1;
+  --popover-foreground: #182b21;
+}
+
+[data-theme="rose-quartz"] {
+  --background: #fcf6f7;
+  --foreground: #38212d;
+  --muted: #f3e7eb;
+  --muted-foreground: #80606d;
+  --border: #e7ced8;
+  --ring: #a53f65;
+  --primary: #933657;
+  --primary-foreground: #ffffff;
+  --popover: #f3e7eb;
+  --popover-foreground: #38212d;
+}
+
+[data-theme="deep-ocean"] {
+  --background: #0c1c24;
+  --foreground: #e2f0f2;
+  --muted: #17323d;
+  --muted-foreground: #9bb8c2;
+  --border: #2a4855;
+  --ring: #72d2d8;
+  --primary: #72d2d8;
+  --primary-foreground: #0c1c24;
+  --popover: #17323d;
+  --popover-foreground: #e2f0f2;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-destructive: var(--destructive);
+}
+
+/* Type and motion tokens. Interface text is Instrument Sans; page and section titles use Bricolage
+   Grotesque; the roadmap diagram alone is hand-lettered in Balsamiq Sans, as on roadmap.sh.
+   Motion is unhurried and never bounces: things glide into place along one shared curve. */
+@theme {
+  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Bricolage Grotesque", "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-hand: "Balsamiq Sans", "Comic Neue", ui-rounded, system-ui, sans-serif;
+  --ease-glide: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-trace: cubic-bezier(0.65, 0, 0.35, 1);
+  --default-transition-duration: 260ms;
+  --default-transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Reserve the vertical scrollbar gutter up front: section content varies in
+   height, and without this the whole page shifts a few pixels sideways each
+   time the viewport scrollbar appears or disappears on load/navigation. */
+html {
+  scrollbar-gutter: stable;
+}
+
+/* One scrollbar treatment for the document and every present/future scrollable
+   element, including portal dialogs, forms, code, tables, and horizontal tabs.
+   Chromium/Safari use rounded inset thumbs; Firefox uses its slim native track. */
+:where(*) {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--muted-foreground) 55%, transparent) transparent;
+}
+@supports selector(::-webkit-scrollbar) {
+  /* Non-auto standard properties override WebKit thumb styling in Chromium. */
+  :where(*) { scrollbar-width: auto; scrollbar-color: auto; }
+  :where(*)::-webkit-scrollbar { width: 10px; height: 10px; }
+  :where(*)::-webkit-scrollbar-track { background: transparent; }
+  :where(*)::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+    background-clip: padding-box;
+  }
+  :where(*)::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--muted-foreground) 75%, transparent); }
+  :where(*)::-webkit-scrollbar-thumb:active { background-color: var(--muted-foreground); }
+  :where(*)::-webkit-scrollbar-corner { background: transparent; }
+  :where(*)::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+}
+@media (forced-colors: active) {
+  :where(*) { scrollbar-width: auto; scrollbar-color: auto; }
+  :where(*)::-webkit-scrollbar { width: 14px; height: 14px; }
+  :where(*)::-webkit-scrollbar-track { background: Canvas; }
+  :where(*)::-webkit-scrollbar-thumb,
+  :where(*)::-webkit-scrollbar-thumb:hover,
+  :where(*)::-webkit-scrollbar-thumb:active { background-color: ButtonText; border-width: 3px; }
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2 {
+  font-family: var(--font-display);
+  font-optical-sizing: auto;
+  letter-spacing: -0.015em;
+}
+
+h1 {
+  letter-spacing: -0.025em;
+}
+
+/* Arabic needs a face with real joining forms and 500/600/700 weights, plus room for
+   diacritics above and below; Latin runs inside Arabic text still use the Latin face. */
+:lang(ar) body,
+body:lang(ar) {
+  font-family: "IBM Plex Sans Arabic", "Noto Sans Arabic", "Segoe UI", Tahoma, system-ui, sans-serif;
+  line-height: 1.6;
+}
+
+/* Isolate machine values (emails, URLs, IDs, file names) so they keep LTR order in RTL text. */
+.ltr-value {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+body,
+header,
+aside,
+main {
+  transition:
+    background-color 0.45s var(--ease-glide),
+    border-color 0.45s var(--ease-glide),
+    color 0.45s var(--ease-glide);
+}
+
+/* ---- Motion language --------------------------------------------------------------------------
+   One curve (glide), three lengths: 0.42s for controls and menus, 0.56s for panels and pages,
+   1.2s for the single drawn moment on the roadmap. Entrances rise a little and come into focus;
+   menus unfold from their trigger; nothing overshoots. */
+@keyframes wp-fade {
+  from { opacity: 0; }
+}
+
+@keyframes wp-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.985);
+    filter: blur(6px);
+  }
+}
+
+@keyframes wp-view {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+    filter: blur(4px);
+  }
+}
+
+@keyframes wp-unfold {
+  from {
+    opacity: 0;
+    clip-path: inset(0 0 100% 0 round 14px);
+  }
+  to {
+    opacity: 1;
+    clip-path: inset(0 0 0 0 round 14px);
+  }
+}
+
+@keyframes wp-sheet {
+  from { transform: translateX(var(--wp-sheet-from, 24px)); opacity: 0; }
+}
+
+.wp-overlay {
+  animation: wp-fade 0.42s var(--ease-glide) both;
+}
+
+.wp-panel {
+  animation: wp-rise 0.56s var(--ease-glide) both;
+}
+
+.wp-view {
+  animation: wp-view 0.56s var(--ease-glide) both;
+}
+
+.wp-menu {
+  transform-origin: top;
+  animation: wp-unfold 0.42s var(--ease-glide) both;
+}
+
+.wp-sheet {
+  animation: wp-sheet 0.56s var(--ease-glide) both;
+}
+
+[dir="rtl"] .wp-sheet {
+  --wp-sheet-from: -24px;
+}
+
+/* ---- Roadmap (roadmap.sh idiom) ---------------------------------------------------------------- */
+.rm-hand {
+  font-family: var(--font-hand);
+  letter-spacing: 0;
+}
+
+.rm-node {
+  transition:
+    background-color 0.42s var(--ease-glide),
+    box-shadow 0.42s var(--ease-glide),
+    transform 0.42s var(--ease-glide),
+    opacity 0.42s var(--ease-glide);
+}
+
+.rm-node:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 4px 4px 0 #000;
+}
+
+[dir="rtl"] .rm-node:hover {
+  transform: translate(2px, -2px);
+  box-shadow: -4px 4px 0 #000;
+}
+
+.rm-node:active {
+  transform: none;
+  box-shadow: 0 0 0 #000;
+  transition-duration: 0.12s;
+}
+
+.rm-spine {
+  transform-origin: top;
+  animation: rm-trace 1.2s var(--ease-trace) both;
+}
+
+.rm-curves {
+  animation: wp-fade 0.7s var(--ease-glide) 0.35s both;
+}
+
+.rm-enter {
+  animation: wp-rise 0.56s var(--ease-glide) both;
+}
+
+.rm-badge {
+  animation: rm-pop 0.42s var(--ease-glide) both;
+}
+
+/* Tailwind's translate utilities use the separate "translate" property, so this only scales. */
+@keyframes rm-trace {
+  from { transform: scaleY(0); }
+}
+
+@keyframes rm-pop {
+  from { transform: scale(0.4); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wp-overlay,
+  .wp-panel,
+  .wp-view,
+  .wp-menu,
+  .wp-sheet,
+  .rm-spine,
+  .rm-curves,
+  .rm-enter,
+  .rm-badge {
+    animation: none;
+  }
+
+  .rm-node:hover {
+    transform: none;
+  }
+}
+
+/* ---- CV Builder: isolated A4 print ------------------------------------------------------------- */
+/* On screen the A4 page is scaled to fit its panel (see cv/A4Frame.tsx); printing always uses the
+   page's true A4 size regardless of that on-screen scale. Everything outside .cv-print-root, and
+   any .no-print element inside it (provenance chips, the editor, nav chrome), is hidden so the
+   printed sheet shows only the CV itself. */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+
+  .cv-print-root,
+  .cv-print-root * {
+    visibility: visible;
+  }
+
+  .cv-print-root {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    height: auto;
+    overflow: visible;
+  }
+
+  .cv-page {
+    transform: none !important;
+    width: auto !important;
+    min-height: 0 !important;
+    max-width: none !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  /* Ask Hermes's "what just changed" highlight is a screen-only review aid; the printed sheet
+     shows only the final text. */
+  .cv-highlight {
+    background: none !important;
+    box-shadow: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  @page {
+    size: A4;
+    margin: 14mm 16mm;
+  }
+}
+
+/* On screen, Ask Hermes briefly washes the field(s) it just changed in the CV's own accent color
+   so a pending edit is easy to spot before Accept/Undo; it never appears in print (see above). */
+.cv-highlight {
+  background: color-mix(in srgb, var(--cv-accent, #f59e0b) 14%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--cv-accent, #f59e0b) 28%, transparent);
+  border-radius: 4px;
+  transition: background-color 0.4s var(--ease-glide), box-shadow 0.4s var(--ease-glide);
+}
+
+.cv-highlight-section {
+  padding: 6px 8px;
+  margin-inline: -8px;
+}
+
+/* Quiz generation fluid tube */
+@keyframes quiz-wave-slide {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes quiz-bubble-rise {
+  0% {
+    transform: translateY(0) scale(1);
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.7;
+  }
+  100% {
+    transform: translateY(-190px) scale(0.55);
+    opacity: 0;
+  }
+}
+
+.quiz-wave {
+  animation: quiz-wave-slide 2.2s linear infinite;
+}
+
+.quiz-bubble {
+  animation: quiz-bubble-rise 2.6s ease-in infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quiz-wave,
+  .quiz-bubble {
+    animation: none;
+  }
+}

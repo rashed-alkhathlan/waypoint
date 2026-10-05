@@ -1,0 +1,145 @@
+// Persistent quiz library (localStorage prototype).
+// Decks keep their extracted text so generation works without re-upload.
+// Saved quizzes keep their questions so they can be retaken anytime.
+// Saved extensions keep AI-generated slides so they can be previewed/exported.
+// Hermes later: swap this file for server-backed storage, same types.
+
+import type { ExtractedSource } from "./quiz-extract";
+import type { QuizQuestion } from "./quiz-ai";
+import type { ExtendedSlide } from "./slides-ai";
+import type { Translate } from "./team-format";
+
+export interface SlideDeck {
+  id: string;
+  fileName: string;
+  kind: "pdf" | "pptx";
+  units: number;
+  chars: number;
+  text: string;
+  uploadedAt: number;
+}
+
+export interface SavedQuiz {
+  id: string;
+  deckIds: string[];
+  deckName: string;
+  questions: QuizQuestion[];
+  difficulty: string;
+  model: string;
+  createdAt: number;
+}
+
+export interface SavedExtension {
+  id: string;
+  deckId: string;
+  deckName: string;
+  deckKind: "pdf" | "pptx";
+  topic: string;
+  slides: ExtendedSlide[];
+  createdAt: number;
+}
+
+export interface QuizLibrary {
+  decks: SlideDeck[];
+  quizzes: SavedQuiz[];
+  extensions: SavedExtension[];
+}
+
+const STORAGE_KEY = "waypoint-quiz-library-v1";
+
+export const EMPTY_LIBRARY: QuizLibrary = { decks: [], quizzes: [], extensions: [] };
+
+export function loadLibrary(): QuizLibrary {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return EMPTY_LIBRARY;
+    const parsed = JSON.parse(raw) as Partial<QuizLibrary>;
+    const quizzes = Array.isArray(parsed.quizzes) ? parsed.quizzes : [];
+    return {
+      decks: Array.isArray(parsed.decks) ? parsed.decks : [],
+      // Migrate single-deck quizzes saved before multi-select.
+      quizzes: quizzes.map((q) => {
+        const legacy = q as SavedQuiz & { deckId?: string | null };
+        if (Array.isArray(legacy.deckIds)) return legacy as SavedQuiz;
+        return {
+          ...legacy,
+          deckIds: legacy.deckId ? [legacy.deckId] : [],
+        } as SavedQuiz;
+      }),
+      extensions: Array.isArray(parsed.extensions) ? parsed.extensions : [],
+    };
+  } catch {
+    return EMPTY_LIBRARY;
+  }
+}
+
+/** Apply a change to the library as it is in storage now, then save it.
+ *  Quizzes and Slides share this key and both outlive their tabs (jobs finish after a tab
+ *  switch), so every write re-reads storage instead of saving a stale in-memory copy. */
+export function updateLibrary(change: (lib: QuizLibrary) => QuizLibrary): { library: QuizLibrary; saved: boolean } {
+  const library = change(loadLibrary());
+  return { library, saved: saveLibrary(library) };
+}
+
+/** Returns false when the browser quota is exceeded. */
+export function saveLibrary(lib: QuizLibrary): boolean {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(lib));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function makeId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `id-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  }
+}
+
+export function deckFromSource(source: ExtractedSource): SlideDeck {
+  return {
+    id: makeId(),
+    fileName: source.fileName,
+    kind: source.kind,
+    units: source.units,
+    chars: source.chars,
+    text: source.text,
+    uploadedAt: Date.now(),
+  };
+}
+
+export type DeckSort = "newest" | "oldest" | "name";
+
+export function sortDecks(decks: SlideDeck[], sort: DeckSort): SlideDeck[] {
+  const copy = [...decks];
+  if (sort === "name") copy.sort((a, b) => a.fileName.localeCompare(b.fileName));
+  else if (sort === "oldest") copy.sort((a, b) => a.uploadedAt - b.uploadedAt);
+  else copy.sort((a, b) => b.uploadedAt - a.uploadedAt);
+  return copy;
+}
+
+/** Short display label for a set of decks: "a.pdf" or "a.pdf + 2 more". */
+export function decksLabel(decks: SlideDeck[], t: Translate): string {
+  if (decks.length === 0) return "";
+  if (decks.length === 1) return decks[0].fileName;
+  return t("quiz.deckLabel", { name: decks[0].fileName, count: decks.length - 1 });
+}
+
+/** Join deck texts with file headers so the model can cite sources. With a budget, every deck
+ *  gets an equal share (unused share passes on), so the first deck cannot crowd out the rest. */
+export function combineDeckTexts(decks: SlideDeck[], budget = Infinity): { text: string; trimmed: boolean } {
+  let remaining = budget;
+  let trimmed = false;
+  const parts = decks.map((deck, index) => {
+    const header = `=== FILE: ${deck.fileName} ===\n`;
+    const share = Math.max(0, Math.floor(remaining / (decks.length - index)) - header.length);
+    const body = deck.text.length > share ? deck.text.slice(0, share) : deck.text;
+    if (body.length < deck.text.length) trimmed = true;
+    remaining -= header.length + body.length + 2;
+    return header + body;
+  });
+  return { text: parts.join("\n\n"), trimmed };
+}

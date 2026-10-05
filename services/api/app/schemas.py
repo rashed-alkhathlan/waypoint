@@ -1,0 +1,893 @@
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal, Union
+
+from pydantic import BaseModel, Field, model_validator
+
+
+FactCategory = Literal["interest", "goal", "course", "skill", "strength", "weakness", "achievement", "preference"]
+HermesProvider = Literal["gemini", "nim", "hf", "openrouter"]
+NodeStatus = Literal["not-started", "in-progress", "done"]
+
+
+class RoadmapResource(BaseModel):
+    label: str
+    url: str
+
+
+class RoadmapOpportunity(BaseModel):
+    opportunity_id: str
+    external_id: str
+    source: str = "hackathonat"
+    detail_url: str
+    registration_url: str = ""
+    source_date: str | None = None
+    date_label: str | None = None
+    locations: list[str] = Field(default_factory=list)
+    virtual: bool = False
+    fetched_at: str
+
+
+class RoadmapNode(BaseModel):
+    id: str
+    stageId: str
+    title: str
+    icon: str = "route"
+    tagline: str = ""
+    description: str = ""
+    subtopics: list[str] = Field(default_factory=list)
+    resources: list[RoadmapResource] = Field(default_factory=list)
+    duration: str = "1 week"
+    level: Literal["Beginner", "Intermediate", "Advanced"] = "Beginner"
+    deps: list[str] = Field(default_factory=list)
+    status: NodeStatus = "not-started"
+    # Evidence item ids that justify a node (e.g. a passed course marking it done).
+    evidence: list[str] = Field(default_factory=list)
+    rationale: str = ""
+    nodeType: Literal["learning", "project", "resource", "opportunity"] = "learning"
+    projectId: str | None = None
+    opportunity: RoadmapOpportunity | None = None
+
+    @model_validator(mode="after")
+    def valid_opportunity(self) -> "RoadmapNode":
+        if self.nodeType == "opportunity" and self.opportunity is None:
+            raise ValueError("Opportunity nodes require authoritative source metadata")
+        if self.nodeType != "opportunity" and self.opportunity is not None:
+            raise ValueError("Opportunity metadata is only valid on opportunity nodes")
+        return self
+
+
+class RoadmapStage(BaseModel):
+    id: str
+    title: str
+    description: str = ""
+    nodeIds: list[str] = Field(default_factory=list)
+    stageType: Literal["foundation", "skill_sequence", "career", "opportunity"] = "skill_sequence"
+
+
+class RoadmapSnapshot(BaseModel):
+    title: str = "Computer Vision Roadmap"
+    stages: list[RoadmapStage]
+    nodes: list[RoadmapNode]
+
+    @model_validator(mode="after")
+    def valid_graph(self) -> "RoadmapSnapshot":
+        ids = [node.id for node in self.nodes]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Roadmap contains duplicate node IDs")
+        known = set(ids)
+        stage_ids = {stage.id for stage in self.stages}
+        graph = {node.id: node.deps for node in self.nodes}
+        for node in self.nodes:
+            if node.stageId not in stage_ids:
+                raise ValueError(f"{node.id} belongs to an unknown stage")
+            if any(dep not in known for dep in node.deps):
+                raise ValueError(f"{node.id} references an unknown prerequisite")
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node_id: str) -> None:
+            if node_id in visiting:
+                raise ValueError("Roadmap dependencies must be acyclic")
+            if node_id in visited:
+                return
+            visiting.add(node_id)
+            for dep in graph[node_id]:
+                visit(dep)
+            visiting.remove(node_id)
+            visited.add(node_id)
+
+        for node_id in graph:
+            visit(node_id)
+        return self
+
+
+# Keep in sync with src/components/roadmap/roadmap-icons.ts.
+ROADMAP_ICONS = frozenset({
+    "code", "grid", "chart", "brain", "image", "waves", "scan", "aperture", "layers", "network",
+    "target", "rocket", "database", "shapes", "gauge", "wrench", "scan-eye", "zap", "spline",
+    "video", "sparkles", "focus", "boxes", "clapperboard", "eye", "milestone", "orbit",
+    "microscope", "cpu", "cloud", "camera", "trophy", "book", "scale", "stethoscope", "heart",
+    "briefcase", "graduation", "calculator", "flask", "pen", "users", "route", "file", "building",
+    "globe", "landmark", "hammer", "cog", "lightbulb",
+})
+
+MAX_GENERATED_STAGES = 8
+MAX_GENERATED_NODES = 40
+MIN_NODES_PER_STAGE = 2
+MAX_NODES_PER_STAGE = 6
+
+
+class RoadmapPlanStage(BaseModel):
+    id: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=600)
+    # How many nodes the stage generation step should produce.
+    node_count: int = Field(default=4, ge=MIN_NODES_PER_STAGE, le=MAX_NODES_PER_STAGE)
+    goal: str = Field(default="", max_length=600)
+    # Foundation is the backward-compatible default for plans produced before
+    # stage typing existed. New planner prompts always provide this field.
+    stage_type: Literal["foundation", "skill_sequence", "career", "opportunity"] = "foundation"
+
+
+class RoadmapPlan(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    stages: list[RoadmapPlanStage] = Field(min_length=2, max_length=MAX_GENERATED_STAGES)
+
+
+def validate_plan(plan: RoadmapPlan) -> RoadmapPlan:
+    """Structural checks for an LLM-produced stage plan (no nodes yet)."""
+    ids = [stage.id for stage in plan.stages]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Roadmap plan contains duplicate stage IDs")
+    return plan
+
+
+def validate_stage_nodes(
+    nodes: list[RoadmapNode],
+    stage_id: str,
+    confirmed_evidence: set[str],
+    legal_dep_ids: set[str],
+    stage_type: str | None = None,
+) -> list[RoadmapNode]:
+    """Checks for one freshly generated stage.
+
+    Connections may only point backwards: every dep must be a node from
+    this stage (already accepted in this batch) or an earlier stage.
+    Unknown or forward references are rejected so the caller retries
+    the stage with the error instead of storing a broken graph.
+    """
+    if not MIN_NODES_PER_STAGE <= len(nodes) <= MAX_NODES_PER_STAGE:
+        raise ValueError(f"Stage {stage_id} must have between {MIN_NODES_PER_STAGE} and {MAX_NODES_PER_STAGE} nodes, got {len(nodes)}")
+    batch_ids = {node.id for node in nodes}
+    projects = [node for node in nodes if node.nodeType == "project"]
+    if stage_type == "skill_sequence" and len(projects) != 1:
+        raise ValueError(f"Skill-sequence stage {stage_id} must end with exactly one project node")
+    if stage_type and stage_type != "skill_sequence" and projects:
+        raise ValueError(f"Stage {stage_id} is {stage_type} and must not contain a project node")
+    if projects and nodes[-1].id != projects[0].id:
+        raise ValueError(f"Project node must be last in stage {stage_id}")
+    seen: set[str] = set()
+    for node in nodes:
+        if node.stageId != stage_id:
+            raise ValueError(f"{node.id} belongs to stage {node.stageId}, expected {stage_id}")
+        if node.id in seen:
+            raise ValueError(f"Stage {stage_id} contains duplicate node ID {node.id}")
+        seen.add(node.id)
+        if node.icon not in ROADMAP_ICONS:
+            node.icon = "target"
+        node.evidence = [item for item in node.evidence if item in confirmed_evidence]
+        if node.status != "not-started" and not node.evidence:
+            node.status = "not-started"
+        if node.status == "in-progress":
+            node.status = "not-started"
+        # Deps may target earlier stages or any node in this same batch
+        # (order within a stage carries no meaning on the canvas).
+        unknown = [dep for dep in node.deps if dep not in legal_dep_ids and dep not in batch_ids]
+        if unknown:
+            raise ValueError(f"{node.id} references unknown prerequisite(s): {', '.join(unknown)}. Only nodes from this or earlier stages are allowed")
+    if projects:
+        local_learning_ids = {node.id for node in nodes if node.nodeType != "project"}
+        if local_learning_ids and not (set(projects[0].deps) & local_learning_ids):
+            raise ValueError("The project must depend on learning from its own skill sequence")
+    return nodes
+
+
+def validate_generated(snapshot: RoadmapSnapshot, confirmed_evidence: set[str]) -> RoadmapSnapshot:
+    """Stricter checks for a whole model-generated roadmap.
+
+    RoadmapSnapshot already guarantees unique node ids, known stages and deps,
+    and a DAG. Here we also require a consistent stage layout, bounded size, and
+    known icons. A node may only start `done` when it cites evidence the student
+    confirmed; anything else is reset rather than trusted.
+    """
+    stage_ids = [stage.id for stage in snapshot.stages]
+    if len(stage_ids) != len(set(stage_ids)):
+        raise ValueError("Roadmap contains duplicate stage IDs")
+    if not 2 <= len(snapshot.stages) <= MAX_GENERATED_STAGES:
+        raise ValueError(f"Roadmap must have between 2 and {MAX_GENERATED_STAGES} stages")
+    if not 4 <= len(snapshot.nodes) <= MAX_GENERATED_NODES:
+        raise ValueError(f"Roadmap must have between 4 and {MAX_GENERATED_NODES} nodes")
+    by_stage = {stage.id: [node.id for node in snapshot.nodes if node.stageId == stage.id] for stage in snapshot.stages}
+    for stage in snapshot.stages:
+        if not by_stage[stage.id]:
+            raise ValueError(f"Stage {stage.id} has no nodes")
+        # The canvas only renders ids listed in nodeIds, so rebuild the list in
+        # the model's order and append any node it forgot to list.
+        ordered = [node_id for node_id in stage.nodeIds if node_id in by_stage[stage.id]]
+        ordered += [node_id for node_id in by_stage[stage.id] if node_id not in ordered]
+        stage.nodeIds = list(dict.fromkeys(ordered))
+    for node in snapshot.nodes:
+        if node.icon not in ROADMAP_ICONS:
+            node.icon = "target"
+        node.evidence = [item for item in node.evidence if item in confirmed_evidence]
+        if node.status != "not-started" and not node.evidence:
+            node.status = "not-started"
+        if node.status == "in-progress":
+            node.status = "not-started"
+    return snapshot
+
+
+class RoadmapOperation(BaseModel):
+    type: Literal["add_node", "update_node", "remove_node", "move_node", "set_dependencies"]
+    node_id: str
+    node: RoadmapNode | None = None
+    changes: dict[str, Any] | None = None
+    stage_id: str | None = None
+    position: int | None = None
+    dependencies: list[str] | None = None
+
+
+class ProgressUpdate(BaseModel):
+    statuses: dict[str, NodeStatus] = Field(min_length=1, max_length=200)
+
+
+class ProposalCreate(BaseModel):
+    user_id: str
+    base_version_id: str
+    summary: str = Field(min_length=3, max_length=240)
+    reasoning: str = Field(min_length=3)
+    operations: list[RoadmapOperation] = Field(min_length=1, max_length=20)
+
+
+class FactCreate(BaseModel):
+    user_id: str
+    category: FactCategory
+    key: str = Field(min_length=1, max_length=120)
+    value: Any
+    source_message_id: str | None = None
+    explicit: bool = True
+    source_kind: Literal["chat", "branch", "onboarding"] = "chat"
+
+
+Discipline = Literal["cs", "engineering", "medicine", "law", "business", "sciences", "design", "other"]
+SourceKind = Literal["transcript_pdf", "cv_pdf", "linkedin_pdf", "linkedin_zip", "github", "folder", "portfolio_url", "orcid"]
+EvidenceKind = Literal["course", "project", "skill", "experience", "certificate", "publication", "activity", "education"]
+
+
+class StudentCreate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+
+
+class ProfileUpdate(BaseModel):
+    institution: str | None = Field(default=None, max_length=200)
+    program: str | None = Field(default=None, max_length=200)
+    discipline: Discipline | None = None
+    year_label: str | None = Field(default=None, max_length=80)
+    grad_target: str | None = Field(default=None, max_length=80)
+    onboarding_status: Literal["basics", "sources", "review", "chat"] | None = None
+
+
+class SourceCreate(BaseModel):
+    kind: SourceKind
+    # username / path / url / orcid, validated per kind in app.sources.
+    value: str = Field(default="", max_length=500)
+    purpose: Literal["projects", "coursework"] | None = None
+
+
+class EvidenceIn(BaseModel):
+    kind: EvidenceKind
+    title: str = Field(min_length=1, max_length=240)
+    data: dict[str, Any] = Field(default_factory=dict)
+    source_ref: str = Field(default="", max_length=500)
+    fingerprint: str | None = Field(default=None, max_length=300)
+
+
+class EvidenceSubmit(BaseModel):
+    user_id: str
+    source_id: str
+    # The folder the plugin actually scanned; checked against the path the student typed.
+    root: str = Field(default="", max_length=1000)
+    items: list[EvidenceIn] = Field(min_length=1, max_length=200)
+
+
+class EvidenceDecision(BaseModel):
+    confirm: list[str] = Field(default_factory=list, max_length=500)
+    dismiss: list[str] = Field(default_factory=list, max_length=500)
+    # Optional student edits to a title before confirming.
+    titles: dict[str, str] = Field(default_factory=dict)
+
+
+class ServerChoosesModel(BaseModel):
+    """The Hermes model is a server setting (Settings > Models & API keys, app_settings `hermes_model`).
+
+    Older tabs still send `provider`/`model` from their retired per-tab choice. They are accepted and
+    dropped here, so a stale tab can neither fail validation nor override the saved choice."""
+    provider: str | None = None
+    model: str | None = None
+
+    @model_validator(mode="after")
+    def use_server_choice(self) -> "ServerChoosesModel":
+        self.provider = None
+        self.model = None
+        return self
+
+
+class GenerateInput(ServerChoosesModel):
+    pass
+
+
+class StageGenerateInput(ServerChoosesModel):
+    job_id: str = Field(min_length=1, max_length=36)
+
+
+class FinalizeInput(BaseModel):
+    job_id: str = Field(min_length=1, max_length=36)
+
+
+class AcceptInput(BaseModel):
+    # Only for `initial` proposals: node ids the student unticked from `done`.
+    not_done: list[str] = Field(default_factory=list, max_length=MAX_GENERATED_NODES)
+
+
+class ChatChoiceOption(BaseModel):
+    id: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    title: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=280)
+    opportunity_id: str | None = Field(default=None, max_length=36)
+    opportunity: dict[str, Any] | None = None
+
+
+class ChatChoiceGroup(BaseModel):
+    mode: Literal["single", "multiple"]
+    prompt: str = Field(min_length=1, max_length=180)
+    options: list[ChatChoiceOption] = Field(min_length=2, max_length=4)
+    min_selections: int = Field(default=1, ge=1, le=4)
+    max_selections: int = Field(default=1, ge=1, le=4)
+
+    @model_validator(mode="after")
+    def valid_selection_limits(self) -> "ChatChoiceGroup":
+        if len({item.id for item in self.options}) != len(self.options):
+            raise ValueError("Choice IDs must be unique")
+        if self.mode == "single":
+            self.min_selections = self.max_selections = 1
+        if self.min_selections > self.max_selections or self.max_selections > len(self.options):
+            raise ValueError("Choice selection limits do not match the available options")
+        return self
+
+
+class ChatFollowUp(BaseModel):
+    id: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    label: str = Field(min_length=1, max_length=80)
+    prompt: str = Field(min_length=1, max_length=500)
+
+
+## Chat elements: the rich UI palette Hermes can attach to a reply (quiz, timer, progress,
+## flashcards, checklist, table, callout, code). This is the exact mirror of the frontend's
+## `src/components/hermes/elements/types.ts` — keep the two in sync, limits included, since a
+## model-authored element is untrusted input until these validators say otherwise.
+
+class QuizQuestionSpec(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    type: Literal["mcq", "true_false", "short_answer"]
+    stem: str = Field(min_length=1, max_length=500)
+    # mcq: 2-4 options. true_false / short_answer: omitted (the UI supplies True/False itself).
+    options: list[str] | None = Field(default=None, max_length=4)
+    answer: str = Field(min_length=1, max_length=300)
+    explanation: str | None = Field(default=None, max_length=600)
+    difficulty: Literal["easy", "medium", "hard"] | None = None
+    time_limit_s: int | None = Field(default=None, ge=5, le=3600)
+
+    @model_validator(mode="after")
+    def valid_for_type(self) -> "QuizQuestionSpec":
+        if self.type == "mcq":
+            if not self.options or not (2 <= len(self.options) <= 4):
+                raise ValueError("An mcq question needs 2-4 options")
+            if self.answer not in self.options:
+                raise ValueError("An mcq answer must exactly match one of its options")
+        elif self.type == "true_false" and self.answer not in ("True", "False"):
+            raise ValueError('A true_false answer must be "True" or "False"')
+        return self
+
+
+class QuizElement(BaseModel):
+    kind: Literal["quiz"] = "quiz"
+    id: str = Field(min_length=1, max_length=64)
+    title: str | None = Field(default=None, max_length=120)
+    questions: list[QuizQuestionSpec] = Field(min_length=1, max_length=10)
+
+
+class TimerElement(BaseModel):
+    kind: Literal["timer"] = "timer"
+    id: str = Field(min_length=1, max_length=64)
+    label: str | None = Field(default=None, max_length=80)
+    duration_s: int = Field(ge=5, le=3600)
+    warning_s: int | None = Field(default=None, ge=0, le=3600)
+    autostart: bool = True
+
+
+class ProgressStep(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=120)
+    done: bool | None = None
+
+
+class ProgressElement(BaseModel):
+    kind: Literal["progress"] = "progress"
+    id: str = Field(min_length=1, max_length=64)
+    title: str | None = Field(default=None, max_length=120)
+    style: Literal["ring", "steps"] | None = None
+    current: int = Field(ge=0)
+    total: int = Field(ge=0)
+    # Only meaningful for style: "steps".
+    steps: list[ProgressStep] | None = Field(default=None, max_length=12)
+
+
+class Flashcard(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    front: str = Field(min_length=1, max_length=300)
+    back: str = Field(min_length=1, max_length=300)
+
+
+class FlashcardsElement(BaseModel):
+    kind: Literal["flashcards"] = "flashcards"
+    id: str = Field(min_length=1, max_length=64)
+    title: str | None = Field(default=None, max_length=120)
+    cards: list[Flashcard] = Field(min_length=1, max_length=20)
+
+
+class ChecklistItem(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=200)
+    done: bool | None = None
+
+
+class ChecklistElement(BaseModel):
+    kind: Literal["checklist"] = "checklist"
+    id: str = Field(min_length=1, max_length=64)
+    title: str | None = Field(default=None, max_length=120)
+    items: list[ChecklistItem] = Field(min_length=1, max_length=15)
+
+
+class TableElement(BaseModel):
+    kind: Literal["table"] = "table"
+    id: str = Field(min_length=1, max_length=64)
+    title: str | None = Field(default=None, max_length=120)
+    columns: list[str] = Field(min_length=1, max_length=6)
+    rows: list[list[str]] = Field(default_factory=list, max_length=20)
+    highlight_column: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def rows_fit_columns(self) -> "TableElement":
+        if any(len(row) > len(self.columns) for row in self.rows):
+            raise ValueError("A table row cannot have more cells than there are columns")
+        if self.highlight_column is not None and self.highlight_column >= len(self.columns):
+            raise ValueError("highlight_column must index an actual column")
+        return self
+
+
+class CalloutElement(BaseModel):
+    kind: Literal["callout"] = "callout"
+    id: str = Field(min_length=1, max_length=64)
+    tone: Literal["tip", "warning", "info", "success"]
+    title: str | None = Field(default=None, max_length=120)
+    body: str = Field(min_length=1, max_length=600)
+
+
+class CodeElement(BaseModel):
+    kind: Literal["code"] = "code"
+    id: str = Field(min_length=1, max_length=64)
+    language: str | None = Field(default=None, max_length=40)
+    code: str = Field(min_length=1, max_length=4000)
+    caption: str | None = Field(default=None, max_length=200)
+
+
+ChatElement = Annotated[
+    Union[
+        QuizElement, TimerElement, ProgressElement, FlashcardsElement,
+        ChecklistElement, TableElement, CalloutElement, CodeElement,
+    ],
+    Field(discriminator="kind"),
+]
+# At most this many elements on one reply — a study coach shows a couple of things at
+# once, not a wall of cards. (The dev-only frontend fixture preview is exempt: it's local
+# UI fixtures, never real Hermes output.)
+MAX_CHAT_ELEMENTS = 6
+
+
+class ChatMessageUi(BaseModel):
+    choice_group: ChatChoiceGroup | None = None
+    follow_ups: list[ChatFollowUp] = Field(default_factory=list, max_length=3)
+    # Onboarding: Hermes has what it needs (waypoint_ready_to_generate); the chat shows Generate.
+    ready_to_generate: bool = False
+    elements: list[ChatElement] = Field(default_factory=list, max_length=MAX_CHAT_ELEMENTS)
+
+    @model_validator(mode="after")
+    def has_controls(self) -> "ChatMessageUi":
+        if self.choice_group is None and not self.follow_ups and not self.ready_to_generate and not self.elements:
+            raise ValueError("A chat interaction must contain choices, follow-ups, or elements")
+        if len({item.id for item in self.follow_ups}) != len(self.follow_ups):
+            raise ValueError("Follow-up IDs must be unique")
+        return self
+
+
+class ChatInteractionInput(BaseModel):
+    kind: Literal["choice", "follow_up"]
+    source_message_id: str = Field(min_length=1, max_length=36)
+    selected_option_ids: list[str] = Field(min_length=1, max_length=3)
+
+
+class ChatInput(ServerChoosesModel):
+    content: str | None = Field(default=None, max_length=8000)
+    interaction: ChatInteractionInput | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_message_kind(self) -> "ChatInput":
+        has_content = bool(self.content and self.content.strip())
+        if has_content == (self.interaction is not None):
+            raise ValueError("Provide either message content or an interaction response")
+        return self
+
+
+class ResetInput(BaseModel):
+    confirm: Literal["RESET"]
+
+
+class ProjectCriterion(BaseModel):
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    title: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=800)
+    weight: int = Field(ge=1, le=100)
+
+
+class ProjectBrief(BaseModel):
+    title: str = Field(min_length=3, max_length=240)
+    problem: str = Field(min_length=3, max_length=3000)
+    objective: str = Field(min_length=3, max_length=3000)
+    deliverables: list[str] = Field(min_length=1, max_length=20)
+    milestones: list[str] = Field(default_factory=list, max_length=20)
+    constraints: list[str] = Field(default_factory=list, max_length=20)
+    tools: list[str] = Field(default_factory=list, max_length=30)
+    resources: list[RoadmapResource] = Field(default_factory=list, max_length=20)
+    rubric: list[ProjectCriterion] = Field(min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def rubric_totals_one_hundred(self) -> "ProjectBrief":
+        if sum(item.weight for item in self.rubric) != 100:
+            raise ValueError("Project rubric weights must total 100")
+        return self
+
+
+class ProjectRevisionCreate(BaseModel):
+    brief: ProjectBrief
+    source: Literal["student", "hermes"] = "student"
+
+
+class ProjectSubmissionCreate(BaseModel):
+    source_type: Literal["github", "zip", "local_directory"]
+    source_ref: str = Field(min_length=1, max_length=1000)
+    snapshot_hash: str = Field(default="", max_length=64)
+    manifest: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectEvaluationCreate(BaseModel):
+    submission_id: str = Field(min_length=1, max_length=36)
+
+
+class EvaluationCriterionResult(BaseModel):
+    criterion_id: str = Field(min_length=1, max_length=64)
+    score: int = Field(ge=0, le=100)
+    evidence: list[str] = Field(default_factory=list, max_length=20)
+    feedback: str = Field(default="", max_length=3000)
+
+
+class EvaluationObservation(BaseModel):
+    id: str = Field(pattern=r"^check-[0-9]+$", max_length=40)
+    title: str = Field(min_length=1, max_length=200)
+    kind: str = Field(max_length=40)
+    passed: bool
+    output: str = Field(max_length=16000)
+    duration_ms: int = Field(ge=0)
+
+
+class EvaluationScreenshot(BaseModel):
+    id: str = Field(pattern=r"^shot-[0-9]+$", max_length=40)
+    title: str = Field(max_length=200)
+    png_base64: str = Field(max_length=2800000)
+
+
+class EvaluationAction(BaseModel):
+    kind: Literal["run_script", "node_cli", "probe_harness", "install_dependencies", "python_tests", "start_server", "http", "browser", "finish"]
+    title: str = Field(min_length=1, max_length=200)
+    script: str = Field(default="", pattern=r"^[A-Za-z0-9_:.-]*$", max_length=80)
+    entry: str = Field(default="", max_length=200)
+    args: list[str] = Field(default_factory=list, max_length=12)
+    path: str = Field(default="/", max_length=500)
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "GET"
+    body: dict | None = None
+    expected_status: int = Field(default=200, ge=100, le=599)
+    expected_text: str = Field(default="", max_length=1000)
+    steps: list[dict] = Field(default_factory=list, max_length=15)
+
+
+class EvaluationReasonRequest(BaseModel):
+    lease_token: str = Field(min_length=16, max_length=64)
+    phase: Literal["next", "review"]
+    context: str = Field(max_length=60000)
+    observations: list[EvaluationObservation] = Field(default_factory=list, max_length=14)
+    remaining: int = Field(default=0, ge=0, le=12)
+
+
+class EvaluationComplete(BaseModel):
+    observations: list[EvaluationObservation] = Field(default_factory=list, max_length=14)
+    screenshots: list[EvaluationScreenshot] = Field(default_factory=list, max_length=8)
+    lease_token: str = Field(min_length=16, max_length=64)
+    adapter: Literal["software", "web", "data_ml", "document", "cad", "circuit", "generic"]
+    score: int = Field(ge=0, le=100)
+    coverage: Literal["low", "medium", "high"]
+    criteria: list[EvaluationCriterionResult] = Field(min_length=1, max_length=12)
+    strengths: list[str] = Field(default_factory=list, max_length=20)
+    improvements: list[str] = Field(default_factory=list, max_length=20)
+    limitations: list[str] = Field(default_factory=list, max_length=20)
+    summary: str = Field(min_length=1, max_length=5000)
+
+
+class EvaluationProgress(BaseModel):
+    observations: list[EvaluationObservation] | None = Field(default=None, max_length=14)
+    lease_token: str = Field(min_length=16, max_length=64)
+    stage: str = Field(min_length=1, max_length=100)
+
+
+class EvaluationFailure(BaseModel):
+    lease_token: str = Field(min_length=16, max_length=64)
+    error: str = Field(min_length=1, max_length=3000)
+
+
+class OpportunityIds(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=20)
+
+
+class RewindInput(BaseModel):
+    # Edit-and-resend: delete this user message and everything after it so
+    # the edited prompt restarts the thread from that point (no duplication).
+    message_id: str = Field(min_length=1, max_length=36)
+
+
+QuizDifficulty = Literal["Easy", "Medium", "Hard", "Mixed"]
+QuizQuestionType = Literal["mcq", "true_false", "short_answer"]
+
+
+class QuizGenerateInput(ServerChoosesModel):
+    source_text: str = Field(min_length=1, max_length=20000)
+    count: int = Field(ge=1, le=20)
+    difficulty: QuizDifficulty = "Mixed"
+    types: list[QuizQuestionType] = Field(min_length=1, max_length=3)
+
+
+class SlidesSuggestInput(ServerChoosesModel):
+    source_text: str = Field(min_length=1, max_length=20000)
+    count: int = Field(default=5, ge=1, le=8)
+    # Optional student whose verified profile + active roadmap are injected
+    # server-side as prompt data. Omitted/unknown => deck-only suggestions.
+    student_id: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+SlidesLength = Literal["short", "medium", "long"]
+
+
+class SlidesExtendInput(ServerChoosesModel):
+    source_text: str = Field(min_length=1, max_length=20000)
+    topic: str = Field(min_length=1, max_length=300)
+    # Length hint only — the model decides the exact slide count.
+    length: SlidesLength = "medium"
+    # Optional design summary extracted from the original deck (fonts, colors,
+    # layout density, visuals) so new slides match its structure, tone, and
+    # visual habits. Styling itself is applied locally at export/preview.
+    design_hint: str = Field(default="", max_length=2000)
+
+
+class SlideColumn(BaseModel):
+    heading: str = Field(default="", max_length=120)
+    bullets: list[str] = Field(default_factory=list, max_length=4)
+
+
+class SlideStat(BaseModel):
+    value: str = Field(min_length=1, max_length=60)
+    label: str = Field(min_length=1, max_length=120)
+
+
+class SlidesExportSlide(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    bullets: list[str] = Field(min_length=1, max_length=8)
+    speaker_notes: str = Field(default="", max_length=2000)
+    # Optional visual structure (mirrors the waypoint-slides skill schema).
+    # Unknown layouts fall back to plain bullets at export/preview.
+    layout: str = Field(default="bullets", max_length=20)
+    kicker: str = Field(default="", max_length=60)
+    columns: list[SlideColumn] = Field(default_factory=list, max_length=2)
+    stats: list[SlideStat] = Field(default_factory=list, max_length=3)
+    visual: str = Field(default="", max_length=200)
+    quote_cite: str = Field(default="", max_length=120)
+
+
+class SlidesExportInput(BaseModel):
+    original_filename: str = Field(min_length=1, max_length=200)
+    topic: str = Field(min_length=1, max_length=300)
+    slides: list[SlidesExportSlide] = Field(min_length=1, max_length=12)
+    # Optional original .pptx bytes (base64): originals are kept and the new
+    # slides reuse their layouts, backgrounds, and text styling.
+    original_pptx_base64: str | None = Field(default=None, max_length=34_000_000)
+    # Optional rendered original pages (PNG/JPEG data URLs or raw base64, for
+    # PDF decks): each becomes a full-bleed image slide ahead of the new ones.
+    original_images_base64: list[str] = Field(default_factory=list, max_length=60)
+    # The divider slide's text in the student's language (the browser owns translations).
+    divider_title: str | None = Field(default=None, max_length=320)
+    divider_note: str | None = Field(default=None, max_length=400)
+
+
+# ---------------------------------------------------------------------------------------------
+# CV Builder (app.cv): strict mirror of src/components/cv/fixtures.ts's CvDocument, Phase B.
+# Generation and the "Ask Hermes" assist panel both produce/patch this shape; every value coming
+# back from a model is re-validated against it before the student (or SQLite) ever sees it.
+# ---------------------------------------------------------------------------------------------
+
+CvTemplateKind = Literal["classic", "modern", "compact"]
+CvSectionKind = Literal["summary", "education", "experience", "projects", "skills", "certificates", "activities", "languages"]
+CV_SECTION_KINDS: frozenset[str] = frozenset(("summary", "education", "experience", "projects", "skills", "certificates", "activities", "languages"))
+
+
+class CvTheme(BaseModel):
+    accent: str = Field(default="#17181c", pattern=r"^#[0-9a-fA-F]{6}$")
+    font: Literal["sans", "serif"] | None = "sans"
+
+
+class CvProvenance(BaseModel):
+    # e.g. "Project Waypoint - evaluation", "Roadmap - Linear Algebra". Must name a real record;
+    # app.cv checks every generated label against the learner context it actually sent the model.
+    label: str = Field(min_length=1, max_length=160)
+
+
+class CvBullet(BaseModel):
+    id: str = Field(min_length=1, max_length=40)
+    text: str = Field(min_length=1, max_length=400)
+    provenance: CvProvenance | None = None
+
+
+class CvEntry(BaseModel):
+    id: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=1, max_length=200)
+    subtitle: str = Field(default="", max_length=200)
+    location: str = Field(default="", max_length=120)
+    start: str = Field(default="", max_length=40)
+    end: str = Field(default="", max_length=40)
+    bullets: list[CvBullet] = Field(default_factory=list, max_length=10)
+    provenance: CvProvenance | None = None
+
+
+class CvSkillGroup(BaseModel):
+    id: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=80)
+    items: list[str] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def clip_items(self) -> "CvSkillGroup":
+        self.items = [str(item).strip()[:60] for item in self.items if str(item).strip()][:30]
+        return self
+
+
+class CvLanguage(BaseModel):
+    id: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1, max_length=60)
+    level: str = Field(default="", max_length=60)
+
+
+class CvCertificate(BaseModel):
+    id: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1, max_length=200)
+    issuer: str = Field(default="", max_length=160)
+    date: str = Field(default="", max_length=40)
+    provenance: CvProvenance | None = None
+
+
+class CvSection(BaseModel):
+    id: str = Field(min_length=1, max_length=40)
+    kind: CvSectionKind
+    title: str = Field(min_length=1, max_length=80)
+    visible: bool = True
+    summary: str | None = Field(default=None, max_length=1200)
+    entries: list[CvEntry] | None = Field(default=None, max_length=12)
+    skills: list[CvSkillGroup] | None = Field(default=None, max_length=10)
+    certificates: list[CvCertificate] | None = Field(default=None, max_length=20)
+    languages: list[CvLanguage] | None = Field(default=None, max_length=10)
+
+    @model_validator(mode="after")
+    def content_matches_kind(self) -> "CvSection":
+        # Exactly one content field may be populated, and it must be the one its `kind` implies —
+        # mirrors the frontend's CvSection union (src/components/cv/fixtures.ts).
+        shape = {
+            "summary": self.summary is not None,
+            "education": self.entries is not None, "experience": self.entries is not None,
+            "projects": self.entries is not None, "activities": self.entries is not None,
+            "skills": self.skills is not None, "certificates": self.certificates is not None,
+            "languages": self.languages is not None,
+        }
+        if not shape.get(self.kind):
+            raise ValueError(f"section {self.id!r} (kind={self.kind!r}) is missing its content field")
+        others = {"summary": self.summary, "entries": self.entries, "skills": self.skills,
+                  "certificates": self.certificates, "languages": self.languages}
+        field_for_kind = "entries" if self.kind in ("education", "experience", "projects", "activities") else (
+            "summary" if self.kind == "summary" else self.kind)
+        extra = [name for name, value in others.items() if value is not None and name != field_for_kind]
+        if extra:
+            raise ValueError(f"section {self.id!r} (kind={self.kind!r}) must not set {extra}")
+        return self
+
+
+class CvContact(BaseModel):
+    # Every field but `name` is optional by design: the student typed it or it is omitted from
+    # the printed CV. Generation never invents a phone, email, or handle — only the draft the
+    # student already has (see CvGenerateInput.contact) ever fills these in.
+    name: str = Field(default="", max_length=120)
+    headline: str = Field(default="", max_length=200)
+    phone: str = Field(default="", max_length=40)
+    email: str = Field(default="", max_length=160)
+    linkedin: str = Field(default="", max_length=200)
+    github: str = Field(default="", max_length=200)
+    city: str = Field(default="", max_length=120)
+
+
+MAX_CV_SECTIONS = 12
+
+
+class CvDocument(BaseModel):
+    template: CvTemplateKind = "modern"
+    theme: CvTheme = Field(default_factory=CvTheme)
+    contact: CvContact = Field(default_factory=CvContact)
+    sections: list[CvSection] = Field(min_length=1, max_length=MAX_CV_SECTIONS)
+
+    @model_validator(mode="after")
+    def unique_section_ids(self) -> "CvDocument":
+        ids = [section.id for section in self.sections]
+        if len(ids) != len(set(ids)):
+            raise ValueError("CV sections must have unique ids")
+        return self
+
+
+class CvGenerateInput(ServerChoosesModel):
+    # A saved posting to tailor the first draft toward (reordering/emphasis only — never invented
+    # content). Omitted => a generic draft from confirmed data alone.
+    posting_id: str | None = Field(default=None, min_length=1, max_length=36)
+    # Contact details the student already typed into a previous draft (or onboarding), carried
+    # over verbatim. Generation never infers a phone number, email, or handle.
+    contact: CvContact | None = None
+
+
+class CvDraftInput(BaseModel):
+    document: CvDocument
+
+
+class CvFieldChange(BaseModel):
+    target_id: str = Field(min_length=1, max_length=160)
+    before: Any = None
+    after: Any = None
+
+
+class CvAssistInput(ServerChoosesModel):
+    instruction: str = Field(min_length=1, max_length=400)
+    document: CvDocument
+    posting_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class CvFitInput(BaseModel):
+    posting_id: str = Field(min_length=1, max_length=36)
+    document: CvDocument | None = None

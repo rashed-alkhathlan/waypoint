@@ -1,0 +1,87 @@
+"""Every checked-in Hermes skill must reach the runtime on every launch path."""
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[3]
+SKILLS = REPO / ".hermes" / "skills"
+RUNNERS = ("run_mac", "run_windows")
+
+
+def skill_names() -> set[str]:
+    return {path.name for path in SKILLS.iterdir() if path.is_dir()}
+
+
+def load_runner(name: str):
+    runner_path = REPO / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, runner_path)
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    return runner
+
+
+def test_every_skill_has_a_skill_md() -> None:
+    missing = [name for name in skill_names() if not (SKILLS / name / "SKILL.md").is_file()]
+    assert not missing, f"no SKILL.md in: {', '.join(sorted(missing))}"
+
+
+def test_docker_mounts_every_skill() -> None:
+    compose = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+    missing = [name for name in skill_names()
+               if f"./.hermes/skills/{name}:/opt/data/skills/{name}:ro" not in compose]
+    assert not missing, f"docker-compose.yml does not mount: {', '.join(sorted(missing))}"
+
+
+@pytest.mark.parametrize("runner_name", RUNNERS)
+def test_runner_syncs_every_skill(runner_name: str, tmp_path: Path, monkeypatch) -> None:
+    runner = load_runner(runner_name)
+
+    runtime = tmp_path / "runtime"
+    monkeypatch.setattr(runner, "RUNTIME", str(runtime))
+    runner.ensure_runtime()
+
+    missing = [name for name in skill_names()
+               if not (runtime / "skills" / name / "SKILL.md").is_file()]
+    assert not missing, f"{runner_name} did not sync: {', '.join(sorted(missing))}"
+
+
+@pytest.mark.parametrize("runner_name", RUNNERS)
+def test_waypoint_gateway_keeps_a_repo_local_hermes_home(runner_name: str) -> None:
+    """Waypoint's gateway must load skills in .hermes-runtime, never the daily-use ~/.hermes."""
+    runner = load_runner(runner_name)
+    env = runner.build_child_env({"HERMES_API_KEY": "k" * 64})
+
+    assert env["HERMES_HOME"] == runner.RUNTIME
+    assert Path(env["HERMES_HOME"]).is_relative_to(REPO)
+    assert Path.home() / ".hermes" != Path(env["HERMES_HOME"])
+    # Host-wide gateway singleton lock must be project-scoped too, or the user's own gateway blocks ours.
+    assert Path(env["HERMES_GATEWAY_LOCK_DIR"]).is_relative_to(env["HERMES_HOME"])
+
+
+def test_prompts_only_reference_provisioned_skills() -> None:
+    from app.quiz import QUIZ_INSTRUCTIONS
+    from app.slides import EXTEND_INSTRUCTIONS
+    from app.teams.hermes_team import TEAM_INSTRUCTIONS
+
+    provisioned = skill_names()
+    for instructions in (EXTEND_INSTRUCTIONS, QUIZ_INSTRUCTIONS, TEAM_INSTRUCTIONS):
+        referenced = {name for name in provisioned if name in instructions}
+        assert referenced, f"prompt references no provisioned skill: {instructions[:200]}"
+        for name in referenced:
+            assert (SKILLS / name / "SKILL.md").is_file()
+
+
+
+
+def test_provision_drops_pre_rename_farq_copies(tmp_path: Path) -> None:
+    """A runtime from before the Waypoint rename must not keep loading the old plugin and skills."""
+    load_runner("run_windows")  # puts the repo root on sys.path for `scripts`
+    from scripts.runtime import provision
+    home = tmp_path / "runtime"
+    for stale in (home / "plugins/farq", home / "skills/farq-quiz", home / "skills/research"):
+        stale.mkdir(parents=True)
+    provision(REPO, home)
+    assert not (home / "plugins/farq").exists() and not (home / "skills/farq-quiz").exists()
+    assert (home / "skills/research").exists(), "Hermes-bundled skills are not ours to remove"
+    assert (home / "plugins/waypoint/plugin.yaml").is_file()

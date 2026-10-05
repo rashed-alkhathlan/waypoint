@@ -1,0 +1,150 @@
+"""Setup uses synthetic credentials and mocked installers; never touches the user's .env."""
+import base64
+import importlib.util
+import os
+from pathlib import Path
+
+import pytest
+
+from scripts.local_env import configure_env, read_env
+from scripts.runtime import child_env
+
+REPO = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture
+def setup_root(tmp_path):
+    (tmp_path / ".env.example").write_text((REPO / ".env.example").read_text(encoding="utf-8"), encoding="utf-8")
+    return tmp_path
+
+
+def test_setup_generates_stable_secrets_and_no_mail_access_token(setup_root):
+    values = configure_env(setup_root, supported=True)
+    assert len(values["HERMES_API_KEY"]) >= 32
+    assert len(values["WAYPOINT_INTERNAL_TOKEN"]) >= 32
+    assert len(values["OUTLOOK_LOCAL_TOKEN"]) >= 32
+    assert len(base64.urlsafe_b64decode(values["WAYPOINT_TOKEN_ENCRYPTION_KEY"])) == 32
+    assert values["GEMINI_API_KEY"] == ""
+    assert "access_token" not in values
+    assert values["HERMES_EMAIL_URL"].endswith(":8642")
+    before = (setup_root / ".env").read_bytes()
+    assert configure_env(setup_root, supported=True) == values
+    assert (setup_root / ".env").read_bytes() == before
+
+
+def test_unsupported_device_gets_no_desktop_token(setup_root):
+    values = configure_env(setup_root, supported=False)
+    assert not values.get("OUTLOOK_LOCAL_TOKEN")
+    assert values["WAYPOINT_TOKEN_ENCRYPTION_KEY"]
+    assert configure_env(setup_root, supported=True)["OUTLOOK_LOCAL_TOKEN"]
+
+
+def test_upgrade_preserves_keys_comments_and_removes_retired_config(setup_root):
+    key = base64.urlsafe_b64encode(b"e" * 32).decode()
+    (setup_root / ".env").write_text(f"# Keep this comment\nGEMINI_API_KEY=existing-provider-key\nHERMES_API_KEY=existing-gateway-key\nWAYPOINT_INTERNAL_TOKEN=existing-internal-key\nWAYPOINT_TOKEN_ENCRYPTION_KEY={key}\nOUTLOOK_LOCAL_TOKEN=existing-local-token\nMICROSOFT_CLIENT_SECRET=retired\nOUTLOOK_CLIENT_ID=retired\nHERMES_EMAIL_URL=http://127.0.0.1:8642\n", encoding="utf-8")
+    values = configure_env(setup_root, supported=True)
+    assert values["GEMINI_API_KEY"] == "existing-provider-key"
+    assert values["HERMES_API_KEY"] == "existing-gateway-key"
+    assert values["WAYPOINT_TOKEN_ENCRYPTION_KEY"] == key
+    assert values["OUTLOOK_LOCAL_TOKEN"] == "existing-local-token"
+    assert "MICROSOFT_CLIENT_SECRET" not in values and "OUTLOOK_CLIENT_ID" not in values
+    assert "# Keep this comment" in (setup_root / ".env").read_text(encoding="utf-8")
+    assert values["HERMES_EMAIL_URL"] == values["HERMES_URL"]
+
+
+def test_invalid_encryption_key_is_not_silently_replaced(setup_root):
+    (setup_root / ".env").write_text("WAYPOINT_TOKEN_ENCRYPTION_KEY=broken\n", encoding="utf-8")
+    before = (setup_root / ".env").read_bytes()
+    with pytest.raises(RuntimeError, match="invalid"):
+        configure_env(setup_root, supported=True)
+    assert (setup_root / ".env").read_bytes() == before
+
+
+def test_child_processes_do_not_receive_mailbox_secrets():
+    values = {"OUTLOOK_LOCAL_TOKEN": "private", "WAYPOINT_TOKEN_ENCRYPTION_KEY": "private",
+              "GEMINI_API_KEY": "provider", "WAYPOINT_INTERNAL_TOKEN": "internal", "HERMES_API_KEY": "gateway"}
+    for name in ("hermes", "web"):
+        env = child_env(name, values)
+        assert "OUTLOOK_LOCAL_TOKEN" not in env and "WAYPOINT_TOKEN_ENCRYPTION_KEY" not in env
+        if name == "web":
+            assert "GEMINI_API_KEY" not in env and "HERMES_API_KEY" not in env
+    assert child_env("api", values)["OUTLOOK_LOCAL_TOKEN"] == "private"
+
+
+def load_setup(monkeypatch):
+    monkeypatch.syspath_prepend(str(REPO / "scripts"))
+    spec = importlib.util.spec_from_file_location("waypoint_setup_test", REPO / "scripts/setup_local.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_installed_hermes_is_verified_without_reinstallation(monkeypatch):
+    module = load_setup(monkeypatch)
+    calls = []
+    monkeypatch.setattr(module, "executable", lambda name: "hermes-existing")
+    monkeypatch.setenv("VIRTUAL_ENV", "waypoint-venv")
+    monkeypatch.setattr(module.subprocess, "run", lambda command, **kwargs: calls.append((command, kwargs)))
+    assert module.ensure_hermes() == "hermes-existing"
+    assert calls[0][0] == ["hermes-existing", "--version"]
+    assert "VIRTUAL_ENV" not in calls[0][1]["env"]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("with_laya", [False, True])
+def test_setup_checks_hermes_and_laya_before_reporting_success(monkeypatch, setup_root, with_laya):
+    module = load_setup(monkeypatch)
+    calls = []
+    monkeypatch.setattr(module, "ROOT", setup_root)
+    monkeypatch.setattr(module.sys, "argv", ["setup_local.py"] + (["--with-laya"] if with_laya else []))
+    monkeypatch.setattr(module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(module.shutil, "which", lambda _: "npm")
+    monkeypatch.setattr(module, "ensure_hermes", lambda: calls.append("hermes"))
+    monkeypatch.setattr(module, "ensure_chromium", lambda _: calls.append("chromium"))
+    monkeypatch.setattr(module, "provision", lambda _: calls.append("runtime"))
+    monkeypatch.setattr(module.subprocess, "run", lambda command, **kwargs: calls.append(command))
+    module.main()
+    assert calls[0] == "hermes"
+    assert calls[1] == ["uv", "sync", "--locked"] + (["--extra", "cpu"] if with_laya else [])
+    assert "chromium" in calls
+    smoke = any(isinstance(command, list) and "--smoke-test" in command and "--download" in command for command in calls)
+    assert smoke is with_laya
+    assert ["npm", "ci"] in calls
+    assert calls[-1] == "runtime"
+    assert read_env(setup_root / ".env")["HERMES_API_KEY"]
+
+
+def test_chromium_skips_download_when_shell_is_installed(monkeypatch, tmp_path):
+    module = load_setup(monkeypatch)
+    shell = tmp_path / "chromium_headless_shell-1"; shell.mkdir(); (shell / "chrome").write_text("")
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return module.subprocess.CompletedProcess(command, 0, stdout=f"Shell\n  Install location:    {shell}\n")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    module.ensure_chromium(Path("python"))
+    assert len(calls) == 1 and "--dry-run" in calls[0]
+    for item in shell.iterdir(): item.unlink()
+    module.ensure_chromium(Path("python"))
+    assert calls[-1][-3:] == ["install", "--only-shell", "chromium"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows uv trampoline recovery")
+def test_stale_windows_hermes_reuses_matching_managed_python(monkeypatch, tmp_path):
+    from scripts import runtime
+    install = tmp_path / "hermes"
+    shim = install / "bin/hermes.exe"; shim.parent.mkdir(parents=True); shim.write_bytes(b"shim")
+    venv = install / "hermes-agent/venv"; venv.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("version_info = 3.11\n")
+    (venv / "Lib/site-packages").mkdir(parents=True)
+    managed = tmp_path / "managed"
+    python = managed / "cpython-3.11.16-windows-x86_64-none/python.exe"
+    python.parent.mkdir(parents=True); python.write_bytes(b"python")
+    monkeypatch.setenv("UV_PYTHON_INSTALL_DIR", str(managed))
+    monkeypatch.setattr(runtime, "executable", lambda _: str(shim))
+    monkeypatch.setattr(runtime, "_probe", lambda command, env: command[0] == str(python))
+    before = (venv / "pyvenv.cfg").read_bytes()
+    command = runtime.hermes_command()
+    assert command[:3] == [str(python), "-I", "-c"]
+    assert "site.addsitedir" in command[3]
+    assert (venv / "pyvenv.cfg").read_bytes() == before

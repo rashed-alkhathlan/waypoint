@@ -1,0 +1,85 @@
+"""Smoke every read-only Blackboard endpoint backing the Hermes tools."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def env_values() -> dict[str, str]:
+    result: dict[str, str] = {}
+    path = REPO / ".env"
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip() and not line.lstrip().startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                result[key.strip()] = value.strip().strip('"').strip("'")
+    return result
+
+
+def read_grant(student_id: str) -> str:
+    """Student tools need a run grant. Issue a short read-only one straight into the local database,
+    as a coach run would (run this on the machine that hosts Waypoint's SQLite file)."""
+    import sys
+    sys.path.insert(0, str(REPO / "services" / "api"))
+    from app.database import Base, SessionLocal, engine
+    from app.tool_grants import READ, issue_grant
+    Base.metadata.create_all(engine)
+    db = SessionLocal()
+    try:
+        token = issue_grant(db, student_id, (READ,), ttl_seconds=120)
+        db.commit()
+        return token
+    finally:
+        db.close()
+
+
+GRANT = ""
+
+
+def get(path: str, token: str) -> dict:
+    request = Request(
+        f"http://127.0.0.1:8000{path}",
+        headers={"X-Waypoint-Internal-Token": token, "X-Waypoint-Grant": GRANT},
+    )
+    with urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def main() -> None:
+    global GRANT
+    token = os.getenv("WAYPOINT_INTERNAL_TOKEN") or env_values().get("WAYPOINT_INTERNAL_TOKEN", "")
+    if not token:
+        raise SystemExit("WAYPOINT_INTERNAL_TOKEN is not set; run setup first")
+    user = "demo-student"
+    GRANT = read_grant(user)
+    courses = get(f"/internal/hermes/students/{user}/blackboard/courses", token)
+    assert courses["courses"], "import the Blackboard demo snapshot first"
+    course = courses["courses"][0]
+    content = get(f"/internal/hermes/students/{user}/blackboard/courses/{course['id']}/content?limit=10", token)
+    assert content["items"]
+    item = content["items"][0]
+    query = quote(item["title"].split()[0])
+    search = get(f"/internal/hermes/students/{user}/blackboard/search?query={query}&limit=5", token)
+    assert search["results"]
+    read = get(f"/internal/hermes/students/{user}/blackboard/items/{search['results'][0]['id']}?cursor=0", token)
+    assert "text" in read and "next_cursor" in read
+    updates = get(f"/internal/hermes/students/{user}/blackboard/updates?since=1970-01-01T00:00:00Z&limit=10", token)
+    assert updates["items"]
+    print(json.dumps({
+        "waypoint_blackboard_list_courses": len(courses["courses"]),
+        "waypoint_blackboard_list_content": len(content["items"]),
+        "waypoint_blackboard_search": len(search["results"]),
+        "waypoint_blackboard_read_item": len(read["text"]),
+        "waypoint_blackboard_list_updates": len(updates["items"]),
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

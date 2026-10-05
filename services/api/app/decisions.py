@@ -1,0 +1,289 @@
+"""Fail-open decision gate: Jev, then Span-01 Lite, then local Laya (see decision_engines).
+
+Jev observes narrow, redacted states. It never writes product state, creates a
+StudentFact, or talks to Hermes directly. Callers keep their deterministic
+behavior unless a purpose is explicitly activated after evaluation.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass
+from typing import Iterable
+
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from . import decision_engines
+from .database import SessionLocal
+from .models import DecisionRecord
+
+logger = logging.getLogger(__name__)
+
+QUESTION_SET_VERSION = "waypoint-v1"
+MAX_ITEMS = 8
+MAX_TEXT_CHARS = 1600
+RERANK_PURPOSES = {"coop_rerank", "hackathon_rerank", "blackboard_rerank"}
+
+# Error observations are never used for caching or reranking (only success rows
+# are read back), so repeating them on every GET just bloats decision_records
+# and collides on SQLite's single writer. Remember recent error fingerprints
+# in-process to skip both the slow engine call and the doomed INSERT batch.
+_ERROR_THROTTLE_TTL_SECONDS = 300
+_error_throttle: dict[str, float] = {}
+_error_throttle_lock = threading.Lock()
+
+
+def _error_throttled(fingerprint: str) -> bool:
+    now = time.monotonic()
+    with _error_throttle_lock:
+        seen_at = _error_throttle.get(fingerprint)
+        if seen_at is not None and now - seen_at < _ERROR_THROTTLE_TTL_SECONDS:
+            return True
+        if seen_at is not None:
+            del _error_throttle[fingerprint]
+        return False
+
+
+def _note_error(fingerprint: str) -> None:
+    with _error_throttle_lock:
+        _error_throttle[fingerprint] = time.monotonic()
+
+_EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+_PHONE = re.compile(r"(?<!\d)(?:\+?966|0)?5\d{8}(?!\d)")
+_LONG_ID = re.compile(r"(?<!\d)\d{8,}(?!\d)")
+_SECRET = re.compile(r"(?i)\b(?:bearer\s+\S+|(?:api[_ -]?key|token|secret|password)\s*[:=]\s*\S+)")
+
+CATEGORY_CRITERIA = {
+    "academic_deadline": "A confirmed academic assessment, submission, or deadline",
+    "learning_resource": "Material useful for learning without a confirmed deadline",
+    "coop_opportunity": "A confirmed internship, employment, or cooperative training opportunity",
+    "event_opportunity": "A confirmed event, workshop, competition, or hackathon",
+    "student_evidence": "Evidence about the student's skills, courses, projects, or achievements",
+    "casual_or_noise": "Casual, promotional, duplicate, uncertain, or non-actionable content",
+}
+
+INTENT_CRITERIA = {
+    "roadmap": "Planning or modifying what the student should learn",
+    "course_content": "Understanding course material or finding learning resources",
+    "deadlines": "Assessments, due dates, schedules, or reminders",
+    "coop": "Companies, internships, cooperative training, or applications",
+    "opportunities": "Hackathons, events, workshops, or competitions",
+    "projects": "Project ideas, refinement, submission, or evaluation",
+    "general_coaching": "General advice or conversation not covered by another route",
+}
+
+
+def enabled() -> bool:
+    """The gate runs when any engine the engine switch allows is configured."""
+    return any(engine["available"] and engine["selected"] for engine in decision_engines.engines_status())
+
+
+def mode() -> str:
+    value = os.getenv("JEV_MODE", "shadow").strip().lower()
+    return value if value in {"off", "shadow", "active"} else "shadow"
+
+
+def active_purposes() -> set[str]:
+    return {part.strip() for part in os.getenv("JEV_ACTIVE_PURPOSES", "").split(",") if part.strip()}
+
+
+def redact_text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+    text = _EMAIL.sub("[email]", text)
+    text = _PHONE.sub("[phone]", text)
+    text = _LONG_ID.sub("[id]", text)
+    return _SECRET.sub("[secret]", text)
+
+
+@dataclass(frozen=True)
+class DecisionItem:
+    entity_type: str
+    entity_id: str
+    title: str
+    text: str
+    student_id: str | None = None
+
+
+def _fingerprint(purpose: str, items: list[DecisionItem]) -> str:
+    material = json.dumps({
+        "purpose": purpose,
+        "version": QUESTION_SET_VERSION,
+        "model": os.getenv("JEV_MODEL", "jev-latest"),
+        "items": [{"type": i.entity_type, "id": i.entity_id, "title": redact_text(i.title), "text": redact_text(i.text)} for i in items],
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _questions(count: int, purpose: str) -> dict[str, dict]:
+    if purpose == "chat_intent":
+        return {"item_0_intent": {"type": "choice", "instructions": "Route this student request to one Waypoint capability", "criteria": INTENT_CRITERIA}}
+    questions: dict[str, dict] = {}
+    for index in range(count):
+        questions[f"item_{index}_category"] = {"type": "choice", "instructions": f"Classify item {index}", "criteria": CATEGORY_CRITERIA}
+        questions[f"item_{index}_actionable"] = {"type": "noul", "instructions": f"Item {index} contains a concrete action the student can take now"}
+        questions[f"item_{index}_urgency"] = {"type": "score", "instructions": f"How urgently should the student see item {index}?", "criteria": ["Store silently", "Weekly summary", "Dashboard soon", "Notify immediately"]}
+        questions[f"item_{index}_roadmap"] = {"type": "score", "instructions": f"How useful is item {index} for adapting the student's learning roadmap?", "criteria": ["Not useful", "Slightly useful", "Useful", "Very useful"]}
+    return questions
+
+
+def _store(db: Session, items: list[DecisionItem], purpose: str, fingerprint: str, payload: dict | None, latency: int | None, error: str | None) -> list[DecisionRecord]:
+    answers = payload.get("answers", {}) if payload else {}
+    usage = payload.get("usage", {}) if payload else {}
+    records = []
+    for index, item in enumerate(items):
+        prefix = f"item_{index}_"
+        item_answers = {key[len(prefix):]: value for key, value in answers.items() if key.startswith(prefix)}
+        record = DecisionRecord(
+            student_id=item.student_id, purpose=purpose, question_set_version=QUESTION_SET_VERSION,
+            entity_type=item.entity_type[:48], entity_id=item.entity_id[:200],
+            model=str((payload or {}).get("model") or os.getenv("JEV_MODEL", "jev-latest"))[:80],
+            mode=mode(), status="error" if error else ("applied" if mode() == "active" and purpose in active_purposes() and purpose in RERANK_PURPOSES else "shadow"),
+            request_fingerprint=fingerprint, answers_json=json.dumps(item_answers, ensure_ascii=False),
+            latency_ms=latency, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"), error_category=error,
+        )
+        records.append(record)
+    # Audit-only writes must never break the caller (read paths 500ed on
+    # "sqlite3.OperationalError: database is locked" when two GETs flushed
+    # concurrent INSERT batches). The SAVEPOINT scopes the rollback to these
+    # rows so sync callers with pending product writes keep their work.
+    try:
+        with db.begin_nested():
+            db.add_all(records)
+            db.flush()
+    except SQLAlchemyError as exc:
+        logger.warning("decision audit skipped for %s (%d items): %s", purpose, len(records), type(exc).__name__)
+        for record in records:
+            try:
+                db.expunge(record)
+            except Exception:
+                pass
+        return []
+    return records
+
+
+def observe_items(db: Session, items: Iterable[DecisionItem], purpose: str = "ingestion") -> list[DecisionRecord]:
+    batch = list(items)[:MAX_ITEMS]
+    if not batch or not enabled() or mode() == "off": return []
+    fingerprint = _fingerprint(purpose, batch)
+    try:
+        cached = db.scalars(select(DecisionRecord).where(
+            DecisionRecord.request_fingerprint == fingerprint,
+            DecisionRecord.purpose == purpose,
+            DecisionRecord.status != "error",
+        )).all()
+    except SQLAlchemyError as exc:
+        logger.warning("decision cache lookup skipped for %s: %s", purpose, type(exc).__name__)
+        return []
+    if cached:
+        by_entity = {(record.entity_type, record.entity_id): record for record in cached}
+        ordered = [by_entity.get((item.entity_type[:48], item.entity_id[:200])) for item in batch]
+        if all(ordered):
+            return [record for record in ordered if record is not None]
+    if _error_throttled(fingerprint):
+        return []
+    state = {"items": [{"id": index, "title": redact_text(item.title), "content": redact_text(item.text)} for index, item in enumerate(batch)]}
+    started = time.perf_counter()
+    error = None; payload = None
+    try:
+        result = decision_engines.ask_chain(json.dumps(state, ensure_ascii=False), _questions(len(batch), purpose))
+        payload = result.payload
+    except decision_engines.EngineUnavailable as exc:
+        error = str(exc)[:40]  # e.g. "jev:timeout,span:http_429"
+    latency = round((time.perf_counter() - started) * 1000)
+    if error:
+        # Error rows are observability only (never read back for cache or
+        # rerank). One batch per fingerprint is enough; every later GET with
+        # the same failing shortlist would otherwise re-wait on the engine
+        # and re-insert an identical 8-row batch under contention.
+        _note_error(fingerprint)
+        try:
+            seen = db.scalar(select(DecisionRecord.id).where(
+                DecisionRecord.request_fingerprint == fingerprint,
+                DecisionRecord.purpose == purpose,
+                DecisionRecord.status == "error",
+            ))
+        except SQLAlchemyError as exc:
+            logger.warning("decision error dedupe skipped for %s: %s", purpose, type(exc).__name__)
+            return []
+        if seen is not None:
+            return []
+    return _store(db, batch, purpose, fingerprint, payload, latency, error)
+
+
+def observe_independently(items: Iterable[DecisionItem], purpose: str = "ingestion") -> None:
+    """Best-effort observation for read paths; never changes the caller's transaction."""
+    db = SessionLocal()
+    try:
+        observe_items(db, items, purpose); db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def rerank(db: Session, values: list[dict], purpose: str, *, student_id: str | None = None) -> list[dict]:
+    """Observe a deterministic shortlist and optionally reorder it.
+
+    Reordering is enabled only for an explicitly activated purpose. Items with
+    missing or low-confidence scores keep their original relative position.
+    """
+    if not values:
+        return values
+    items = [DecisionItem(
+        entity_type=purpose,
+        entity_id=str(value.get("id") or value.get("external_id") or index),
+        title=str(value.get("title") or value.get("name") or "Candidate"),
+        text=json.dumps(value, ensure_ascii=False, default=str),
+        student_id=student_id,
+    ) for index, value in enumerate(values[:MAX_ITEMS])]
+    records = observe_items(db, items, purpose)
+    # Retrieval functions run under GET dependencies, which otherwise close
+    # without committing their audit observations.
+    if records:
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            logger.warning("decision audit commit skipped for %s: %s", purpose, type(exc).__name__)
+            db.rollback()
+            return values
+    if mode() != "active" or purpose not in active_purposes() or len(records) != len(items):
+        return values
+    scored: list[tuple[float, int, dict]] = []
+    for index, value in enumerate(values[:MAX_ITEMS]):
+        try:
+            answer = json.loads(records[index].answers_json).get("roadmap", {})
+            confidence = float(answer.get("confidence", 0))
+            score = float(answer.get("score", 0)) if confidence >= .70 else -1
+        except (TypeError, ValueError, json.JSONDecodeError):
+            score = -1
+        scored.append((score, index, value))
+    ranked = [value for _score, _index, value in sorted(scored, key=lambda row: (-row[0], row[1]))]
+    return ranked + values[MAX_ITEMS:]
+
+
+def status(db: Session) -> dict:
+    latest = db.scalar(select(DecisionRecord).order_by(DecisionRecord.created_at.desc()))
+    success = db.scalar(select(DecisionRecord).where(DecisionRecord.status != "error").order_by(DecisionRecord.created_at.desc()))
+    failure = db.scalar(select(DecisionRecord).where(DecisionRecord.status == "error").order_by(DecisionRecord.created_at.desc()))
+    engines = decision_engines.engines_status()
+    lead = next((engine for engine in engines if engine["available"] and engine["selected"]), None)
+    configured = lead is not None
+    state = "disabled" if not configured or mode() == "off" else "degraded" if latest and latest.status == "error" else "active" if mode() == "active" else "observing"
+    return {
+        "state": state, "enabled": configured, "mode": mode(),
+        "engine": lead["id"] if lead else None, "engine_label": lead["label"] if lead else None,
+        "model": lead["model"] if lead else None, "engines": engines,
+        "engine_choice": decision_engines.engine_choice(),
+        "active_purposes": sorted(active_purposes()),
+        "last_success_at": success.created_at.isoformat() if success else None,
+        "last_failure_at": failure.created_at.isoformat() if failure else None,
+        "last_error": failure.error_category if failure else None,
+    }

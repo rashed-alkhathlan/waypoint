@@ -1,0 +1,107 @@
+services:
+  web:
+    build: .
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      DATABASE_URL: sqlite:////data/waypoint.db
+      HERMES_URL: http://hermes:8642
+      HERMES_EMAIL_URL: http://hermes:8642
+      HERMES_API_KEY: ${HERMES_API_KEY:?Run setup.bat or setup.sh first}
+      HERMES_MODEL: ${HERMES_MODEL:-gemini-3.8-flash}
+      HERMES_PROVIDER: ${HERMES_PROVIDER:-gemini}
+      # Same provider key the Hermes gateway uses; lets the API transcribe
+      # voice clips server-side so the browser never holds a Gemini key.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      WAYPOINT_INTERNAL_TOKEN: ${WAYPOINT_INTERNAL_TOKEN:?Run setup.bat or setup.sh first}
+      OPPORTUNITY_SYNC_ENABLED: ${OPPORTUNITY_SYNC_ENABLED:-true}
+      COOP_TELEGRAM_ARCHIVE_ENABLED: ${COOP_TELEGRAM_ARCHIVE_ENABLED:-true}
+      COOP_TELEGRAM_ARCHIVE_URL: ${COOP_TELEGRAM_ARCHIVE_URL:-https://t.me/s/nobthacv1}
+      COOP_LINKEDIN_ENABLED: ${COOP_LINKEDIN_ENABLED:-true}
+      APIFY_API_KEY: ${APIFY_API_KEY:-}
+      APIFY_LINKEDIN_ACTOR_ID: ${APIFY_LINKEDIN_ACTOR_ID:-hKByXkMQaC5Qt9UMN}
+      APIFY_MAX_TOTAL_CHARGE_USD: ${APIFY_MAX_TOTAL_CHARGE_USD:-0.06}
+      TYPESAFE_AI_API_KEY: ${TYPESAFE_AI_API_KEY:-}
+      JEV_ENABLED: ${JEV_ENABLED:-true}
+      JEV_MODE: ${JEV_MODE:-shadow}
+      JEV_MODEL: ${JEV_MODEL:-jev-latest}
+      JEV_TIMEOUT_SECONDS: ${JEV_TIMEOUT_SECONDS:-5}
+      JEV_ACTIVE_PURPOSES: ${JEV_ACTIVE_PURPOSES:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      SPAN_ENABLED: ${SPAN_ENABLED:-true}
+      SPAN_MODEL: ${SPAN_MODEL:-respan/span-01-lite}
+      SPAN_TIMEOUT_SECONDS: ${SPAN_TIMEOUT_SECONDS:-10}
+      OUTLOOK_APP_ORIGIN: ${OUTLOOK_APP_ORIGIN:-http://localhost:5173}
+      WAYPOINT_TOKEN_ENCRYPTION_KEY: ${WAYPOINT_TOKEN_ENCRYPTION_KEY:-}
+      OUTLOOK_SYNC_ENABLED: ${OUTLOOK_SYNC_ENABLED:-false}
+      HF_HOME: /data/model-cache
+      # Settings > Skills reads the built-in skills and the gateway's learned skills.
+      WAYPOINT_SKILLS_DIR: /app/hermes-skills
+      WAYPOINT_HERMES_HOME: /hermes-home
+    volumes:
+      - waypoint-data:/data
+      - hermes-data:/hermes-home
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10m
+
+  hermes:
+    image: nousresearch/hermes-agent:v2026.9.14
+    command: gateway
+    working_dir: /workspace
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: 8642
+      API_SERVER_KEY: ${HERMES_API_KEY:?Run setup.bat or setup.sh first}
+      HERMES_ENABLE_PROJECT_PLUGINS: "1"
+      HERMES_MODEL: ${HERMES_MODEL:-gemini-3.8-flash}
+      WAYPOINT_API_INTERNAL_URL: http://api:8000
+      WAYPOINT_INTERNAL_TOKEN: ${WAYPOINT_INTERNAL_TOKEN:?Run setup.bat or setup.sh first}
+    volumes:
+      - hermes-data:/opt/data
+      - ./services/hermes/config.yaml:/opt/data/config.yaml:ro
+      - ./services/hermes/SOUL.md:/opt/data/SOUL.md:ro
+      - ./.hermes/plugins/waypoint:/opt/data/plugins/waypoint:ro
+      - ./.hermes/skills/waypoint-student-coach:/opt/data/skills/waypoint-student-coach:ro
+      - ./.hermes/skills/waypoint-onboarding:/opt/data/skills/waypoint-onboarding:ro
+      - ./.hermes/skills/waypoint-quiz:/opt/data/skills/waypoint-quiz:ro
+      - ./.hermes/skills/waypoint-slides:/opt/data/skills/waypoint-slides:ro
+      - ./.hermes/skills/waypoint-project-coach:/opt/data/skills/waypoint-project-coach:ro
+      - ./.hermes/skills/waypoint-team-coach:/opt/data/skills/waypoint-team-coach:ro
+      - ./.hermes/skills/waypoint-memory:/opt/data/skills/waypoint-memory:ro
+      - ./.hermes/skills/waypoint-roadmap-builder:/opt/data/skills/waypoint-roadmap-builder:ro
+      - ./.hermes/skills/waypoint-mail-assistant:/opt/data/skills/waypoint-mail-assistant:ro
+      - ./.hermes/skills/waypoint-collaboration-coach:/opt/data/skills/waypoint-collaboration-coach:ro
+      - ./.hermes/skills/waypoint-project-import:/opt/data/skills/waypoint-project-import:ro
+      # Seed only Hermes' essential skill, not its ~60 general bundled skills (see scripts/runtime.py).
+      - ./services/hermes/no-bundled-skills:/opt/data/.no-bundled-skills:ro
+      # Onboarding folder scans only see paths inside this container. To let Hermes index
+      # a host folder, mount it read-only and type the container path, e.g.:
+      # - C:/Users/me/Projects:/scan/projects:ro
+    ports:
+      - "8642:8642"
+    depends_on:
+      api:
+        condition: service_started
+
+
+volumes:
+  waypoint-data:
+  hermes-data:

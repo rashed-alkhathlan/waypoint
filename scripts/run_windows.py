@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Waypoint one-command dev runner (Windows).
+
+Starts FastAPI (:8000), Coach/email Q&A (:8642), and Vite (:5173).
+Press Ctrl+C once and everything shuts down.
+
+Usage:
+    run.bat
+
+Windows port of run_mac.py. Differences that matter:
+- Each service runs in its own Job Object with KILL_ON_JOB_CLOSE, so stopping a
+  service (or this runner dying for any reason, window close included) takes its
+  whole process tree with it: npm -> cmd -> node, hermes.exe -> python.
+- Services get their own process group, so only this runner sees Ctrl+C and
+  npm never asks "Terminate batch job (Y/N)?".
+- Hermes starts without the Waypoint venv's Python variables (see the shared runtime).
+"""
+from __future__ import annotations
+
+import ctypes
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_FILE = os.path.join(REPO, ".env")
+RUNTIME = os.path.join(REPO, ".hermes-runtime")
+
+API_PORT = 8000
+HERMES_PORT = 8642
+WEB_PORT = 5173
+
+STOP = threading.Event()
+# Health probes must never go through a system proxy from the Windows registry.
+_LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def log(msg: str) -> None:
+    print(f"[waypoint] {msg}", flush=True)
+
+
+sys.path.insert(0, REPO)
+from scripts.local_env import configure_env, read_env
+from scripts.runtime import build_env, child_env, restart_targets, executable, hermes_command, provision, require_python
+from pathlib import Path
+
+
+def read_dotenv_values():
+    return read_env(Path(ENV_FILE))
+
+
+def load_env():
+    os.environ.update(configure_env(Path(REPO)))
+
+
+def ensure_venv():
+    return require_python(Path(REPO))
+
+
+def ensure_runtime():
+    provision(Path(REPO), Path(RUNTIME))
+
+
+def build_child_env(values):
+    return build_env(values, Path(REPO), Path(RUNTIME))
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+    )]
+
+
+class _BasicLimits(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _ExtendedLimits(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimits),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class Job:
+    """Windows job object whose processes (and their descendants) die when it closes."""
+
+    _EXTENDED_LIMIT_INFORMATION = 9
+    _KILL_ON_JOB_CLOSE = 0x2000
+
+    def __init__(self) -> None:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = ctypes.c_void_p
+        k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+        k32.SetInformationJobObject.argtypes = (
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+        k32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        k32.TerminateJobObject.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        self._k32 = k32
+        self._handle = k32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = _ExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = self._KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(
+                self._handle, self._EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def adopt(self, proc: subprocess.Popen) -> None:
+        if not self._k32.AssignProcessToJobObject(self._handle, int(proc._handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self._handle:
+            self._k32.TerminateJobObject(self._handle, 1)
+            self._k32.CloseHandle(self._handle)
+            self._handle = None
+
+
+class Service:
+    """One started child process plus whatever it takes to stop its whole tree."""
+
+    def __init__(self, name: str, cmd: list[str], env: dict[str, str]) -> None:
+        self.proc = subprocess.Popen(
+            cmd, cwd=REPO, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        self.job: Job | None = None
+        try:
+            job = Job()
+            try:
+                job.adopt(self.proc)
+            except OSError:
+                job.close()
+                raise
+            self.job = job
+        except OSError as exc:
+            log(f"{name}: no job object ({exc}); falling back to taskkill on shutdown")
+        threading.Thread(target=stream, args=(name, self.proc), daemon=True).start()
+
+    def stop(self) -> None:
+        if self.job is not None:
+            self.job.close()
+        elif self.proc.poll() is None:
+            subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def stream(name: str, proc: subprocess.Popen) -> None:
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(f"[{name}] {line.rstrip()}", flush=True)
+
+
+def port_in_use(port: int) -> bool:
+    # A short connect beats an HTTP probe: Windows takes ~2 s to refuse a closed
+    # localhost port, while a listener accepts instantly.
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def wait_healthy(url: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not STOP.is_set():
+        try:
+            with _LOCAL.open(url, timeout=3) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+
+def enable_console_colors() -> None:
+    """Vite always emits ANSI colors on Windows; classic conhost only renders them in VT mode."""
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetStdHandle.restype = ctypes.c_void_p
+    k32.GetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+    k32.SetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    handle = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if k32.GetConsoleMode(handle, ctypes.byref(mode)):  # false when stdout is redirected
+        k32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+def main() -> int:
+    if os.name != "nt":
+        log("ERROR: this runner is for Windows — use scripts/run_mac.py instead.")
+        return 1
+    sys.stdout.reconfigure(errors="replace")
+    enable_console_colors()
+
+    for name, port in (("api", API_PORT), ("hermes", HERMES_PORT), ("web", WEB_PORT)):
+        if port_in_use(port):
+            log(f"ERROR: {name} port {port} is already in use — stop it first, then re-run.")
+            return 1
+
+    load_env()
+    npm = shutil.which("npm")
+    if not npm:
+        log("ERROR: npm not found — install Node.js first.")
+        return 1
+    hermes = executable("hermes")
+    if not hermes:
+        log("ERROR: hermes binary not found on PATH.")
+        return 1
+    hermes_cmd = hermes_command()
+    if hermes_cmd is None:
+        log("ERROR: the hermes launcher on PATH is broken (its managed Python is missing).")
+        log("Repair the global install by re-running the official Hermes installer, then re-run run.bat.")
+        return 1
+    if not os.path.isdir(os.path.join(REPO, "node_modules")):
+        log("Run setup.bat (Windows) or bash setup.sh (macOS) first.")
+        return 1
+    py = ensure_venv()
+    ensure_runtime()
+
+    commands = {
+        "evaluator": [py, "-u", "scripts/evaluator_worker.py"],
+        "api": [py, "-m", "uvicorn", "app.main:app", "--app-dir", "services/api",
+                "--port", str(API_PORT), "--no-access-log"],
+        # NOTE: `gateway run` stays in the foreground as our child, tied to
+        # HERMES_HOME above. Bare `hermes gateway` would daemonize and escape
+        # shutdown, so never use it here.
+        "hermes": [*hermes_cmd, "gateway", "run"],
+        # npm resolves to npm.cmd; Popen needs its full path to run it.
+        "web": [npm, "run", "dev", "--", "--host", "127.0.0.1", "--port", str(WEB_PORT)],
+    }
+    # Only Waypoint's own children are ever restarted here. The daily-use base
+    # Hermes profile is never touched: different HERMES_HOME, no stop/restart
+    # commands against it.
+    RESTARTABLE = ("api", "hermes", "evaluator")
+    children: dict[str, Service] = {}
+    pending_restart: set[str] = set()
+    lock = threading.Lock()
+
+    def spawn(name: str) -> None:
+        env = build_child_env(read_dotenv_values())
+        env = child_env(name, env, Path(REPO))
+        children[name] = Service(name, commands[name], env)
+
+    def watch_env() -> None:
+        """Restart api+hermes when Apply-in-Settings (or a hand edit) changes .env."""
+        try:
+            last = os.path.getmtime(ENV_FILE)
+        except OSError:
+            last = 0.0
+        known = read_dotenv_values()
+        while not STOP.is_set():
+            time.sleep(2)
+            try:
+                mtime = os.path.getmtime(ENV_FILE)
+            except OSError:
+                continue
+            if mtime == last:
+                continue
+            time.sleep(1.5)  # debounce: let the atomic .env replace settle
+            try:
+                settled = os.path.getmtime(ENV_FILE)
+            except OSError:
+                continue
+            if settled != mtime:
+                last = settled
+                continue
+            last = mtime
+            current = read_dotenv_values()
+            targets = restart_targets(known, current, RESTARTABLE)
+            known = current
+            if not targets:
+                continue
+            log(f".env changed — restarting {'+'.join(targets)} with new settings ...")
+            with lock:
+                if STOP.is_set():
+                    return
+                pending_restart.update(targets)
+                victims = [children.pop(name, None) for name in targets]
+            for service in victims:
+                if service is not None:
+                    service.stop()
+            with lock:
+                # Shutdown may have started while we were stopping; never
+                # spawn a child the main thread will not clean up.
+                if STOP.is_set():
+                    return
+                for name in targets:
+                    try:
+                        spawn(name)
+                    except Exception as exc:
+                        log(f"{name} failed to restart: {exc}")
+                pending_restart.difference_update(targets)
+            for name, url in (("api", f"http://127.0.0.1:{API_PORT}/api/health"), ("hermes", f"http://127.0.0.1:{HERMES_PORT}/health")):
+                if name not in targets:
+                    continue
+                if wait_healthy(url, 20):
+                    log(f"{name} restarted with new settings")
+                else:
+                    log(f"{name} did NOT come back — see [{name}] output above")
+
+    # Handlers go in before any child exists, so Ctrl+C during startup still
+    # reaches the cleanup below instead of orphaning half-started services.
+    def on_signal(_signum, _frame):
+        STOP.set()
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGBREAK, on_signal)
+
+    try:
+        with lock:
+            for child_name in commands:
+                spawn(child_name)
+        threading.Thread(target=watch_env, daemon=True).start()
+
+        ok = wait_healthy(f"http://127.0.0.1:{API_PORT}/api/health", 30)
+        log(f"api    :{API_PORT} " + ("up" if ok else "DID NOT START — see [api] output"))
+        ok = wait_healthy(f"http://127.0.0.1:{HERMES_PORT}/health", 30)
+        log(f"hermes :{HERMES_PORT} " + ("up" if ok else "DID NOT START — see [hermes] output"))
+        ok = wait_healthy(f"http://127.0.0.1:{WEB_PORT}/", 45)
+        log(f"web    :{WEB_PORT} " + ("up" if ok else "DID NOT START — see [web] output"))
+
+        if not STOP.is_set():
+            print("\n  Site:  http://127.0.0.1:5173", flush=True)
+            print("  API docs: http://127.0.0.1:8000/docs", flush=True)
+            print("  Press Ctrl+C to shut everything down.\n", flush=True)
+
+        while not STOP.is_set():
+            time.sleep(0.2)
+            with lock:
+                snapshot = list(children.items())
+                restarting = set(pending_restart)
+            for name, service in snapshot:
+                if service.proc.poll() is not None and name not in restarting:
+                    log(f"{name} exited (code {service.proc.returncode}) — shutting down the rest.")
+                    STOP.set()
+                    break
+    finally:
+        STOP.set()
+        log("shutting down ...")
+        with lock:
+            remaining = list(children.values())
+        for service in remaining:
+            service.stop()
+        log("all stopped. Bye!")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

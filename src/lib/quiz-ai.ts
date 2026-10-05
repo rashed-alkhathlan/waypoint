@@ -1,0 +1,462 @@
+import { API_BASE, formatErrorDetail } from "./waypoint-api";
+
+// ─────────────────────────────────────────────────────────────
+// quiz-ai.ts — THE swappable AI backbone for Waypoint quizzes.
+//
+// Hermes backend: the browser POSTs slide text to the Waypoint API, which runs
+// the quiz prompt on the local Hermes gateway (server-side keys only).
+// UI code must only import the types + `generateQuiz` + `getMockQuiz`
+// from this file.
+//
+// Contract:
+//   input:  source slide text + options
+//   output: QuizQuestion[] (validated, UI-ready)
+// ─────────────────────────────────────────────────────────────
+
+export type QuizQuestionType = "mcq" | "true_false" | "short_answer";
+
+export interface QuizQuestion {
+  id: string;
+  type: QuizQuestionType;
+  question: string;
+  /** MCQ: 4 options. true_false: ["True","False"]. short_answer: undefined. */
+  options?: string[];
+  /** MCQ: exact option text. true_false: "True"|"False". short_answer: reference answer. */
+  answer: string;
+  explanation?: string;
+  source?: string;
+}
+
+export type QuizDifficulty = "Easy" | "Medium" | "Hard" | "Mixed";
+
+export interface QuizGenerationOptions {
+  count: number;
+  difficulty: QuizDifficulty;
+  types: QuizQuestionType[];
+  /** Optional AbortSignal so the UI can cancel a slow generation. */
+  signal?: AbortSignal;
+  /** Real progress events while the response streams in. */
+  onProgress?: (p: QuizProgress) => void;
+}
+
+/** Live stage of a streaming generation. */
+export type QuizLiveStage = "waiting" | "receiving" | "validating" | "done";
+
+/** Genuine transfer progress: bytes actually received + questions actually parsed. */
+export interface QuizProgress {
+  /** 0–100 */
+  percent: number;
+  stage: QuizLiveStage;
+  /** Raw characters received so far (includes reasoning traces). */
+  charsReceived: number;
+  /** Complete question objects parsed from the content so far. */
+  parsedQuestions: number;
+  /** Questions requested. */
+  totalQuestions: number;
+}
+
+/** Max chars of slide text sent for generation — keeps it fast + cheap. */
+export const MAX_SOURCE_CHARS = 12_000;
+
+export type QuizAIErrorCode =
+  | "emptyOutput"
+  | "nonJson"
+  | "unauthorized"
+  | "invalidRequest"
+  | "unavailable"
+  | "requestFailed"
+  | "noSource"
+  | "noTypes"
+  | "unreachable"
+  | "unreadable"
+  | "empty"
+  | "noQuestions";
+
+export class QuizAIError extends Error {
+  status?: number;
+  /** True when retrying later (or with another model) may succeed. */
+  retryable?: boolean;
+  /** UI message key (quiz.errors.ai.<code>) + params; absent when the message is server detail. */
+  code?: QuizAIErrorCode;
+  params?: Record<string, string | number>;
+  constructor(
+    message: string,
+    status?: number,
+    retryable?: boolean,
+    code?: QuizAIErrorCode,
+    params?: Record<string, string | number>,
+  ) {
+    super(message);
+    this.name = "QuizAIError";
+    this.status = status;
+    this.retryable = retryable;
+    this.code = code;
+    this.params = params;
+  }
+}
+
+/** Strip ```json fences etc. then JSON.parse. Throws QuizAIError on failure. */
+/** First 200 chars of raw output, for diagnosable error messages. */
+function outputSnippet(raw: string): string {
+  const oneLine = raw.trim().replace(/\s+/g, " ");
+  if (!oneLine) return "(empty response)";
+  return oneLine.length > 200 ? `${oneLine.slice(0, 200)}…` : oneLine;
+}
+
+function parseQuizJson(raw: string): QuizQuestion[] {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "");
+  if (!cleaned) {
+    throw new QuizAIError(
+      "Model returned an empty answer — it likely ran out of tokens. Try fewer questions or a smaller deck.",
+      undefined,
+      undefined,
+      "emptyOutput",
+    );
+  }
+  // 1) Pristine JSON.
+  try {
+    const parsed = JSON.parse(cleaned) as { questions?: unknown };
+    if (Array.isArray(parsed.questions)) return sanitizeQuestions(parsed.questions);
+  } catch {
+    // Fall through to salvage strategies.
+  }
+  // 2) Prose wrapper: isolate the outermost {...} block.
+  const block = cleaned.match(/\{[\s\S]*\}/)?.[0];
+  if (block) {
+    try {
+      const parsed = JSON.parse(block) as { questions?: unknown };
+      if (Array.isArray(parsed.questions)) return sanitizeQuestions(parsed.questions);
+    } catch {
+      // Fall through: possibly truncated — try brace repair.
+    }
+    // 3) Truncated output: close open brackets/braces and retry.
+    const repaired = repairTruncatedJson(block);
+    if (repaired) {
+      try {
+        const parsed = JSON.parse(repaired) as { questions?: unknown };
+        if (Array.isArray(parsed.questions)) {
+          const salvaged = sanitizeQuestions(parsed.questions);
+          if (salvaged.length > 0) return salvaged;
+        }
+      } catch {
+        // Fall through to per-question salvage.
+      }
+    }
+  }
+  // 4) Last resort: parse each complete question object on its own.
+  // Question objects contain no nested braces, so flat matching works.
+  const singles: unknown[] = [];
+  for (const m of cleaned.matchAll(/\{[^{}]*"type"\s*:\s*"[^"]*"[^{}]*\}/g)) {
+    try {
+      singles.push(JSON.parse(m[0]));
+    } catch {
+      // Skip the broken one, keep the rest.
+    }
+  }
+  const salvaged = sanitizeQuestions(singles);
+  if (salvaged.length > 0) return salvaged;
+  throw new QuizAIError(
+    `Model returned non-JSON output. Received: ${outputSnippet(raw)}`,
+    undefined,
+    undefined,
+    "nonJson",
+    { snippet: outputSnippet(raw) },
+  );
+}
+
+/**
+ * Close unterminated arrays/objects/strings in truncated model output.
+ * Returns null when the text is too broken to repair.
+ */
+function repairTruncatedJson(block: string): string | null {
+  let text = block;
+  // Drop a trailing partial string value: ..."key": "partial
+  const lastQuote = text.lastIndexOf('"');
+  const lastColon = text.lastIndexOf(":");
+  const lastBrace = Math.max(text.lastIndexOf("{"), text.lastIndexOf("["));
+  if (lastQuote > lastColon && lastQuote > lastBrace) {
+    text = text.slice(0, lastQuote);
+    // Remove the now-dangling key (..."key":) or comma separator.
+    text = text.replace(/,\s*"[^"]*$|"[^"]*:\s*$/, "");
+  }
+  // Balance brackets outside of strings, closing innermost-first.
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of text) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") stack.push(ch);
+    else if ((ch === "}" || ch === "]") && stack.length > 0) stack.pop();
+  }
+  if (inString || stack.length === 0 || stack.length > 20) return null;
+  let closers = "";
+  while (stack.length > 0) {
+    const open = stack.pop();
+    closers += open === "{" ? "}" : "]";
+  }
+  return `${text}${closers}`;
+}
+
+const TRUE_WORDS = new Set(["true", "t", "yes", "y", "correct", "right", "1", "صح", "صحيح", "نعم"]);
+const FALSE_WORDS = new Set(["false", "f", "no", "n", "incorrect", "wrong", "0", "خطأ", "خاطئ", "خطا", "لا"]);
+
+/** "True"/"False" from the many ways a model writes them, or null when it is neither. */
+export function normalizeTrueFalse(answer: string): "True" | "False" | null {
+  const word = answer.trim().toLowerCase().replace(/[.!\s]+$/u, "");
+  if (TRUE_WORDS.has(word)) return "True";
+  if (FALSE_WORDS.has(word)) return "False";
+  return null;
+}
+
+/** The option an MCQ answer refers to: exact text, case/space-insensitive text, a letter
+ *  ("B", "(b)", "Option B", "B) …") or a 1-based index. Null when it matches nothing. */
+export function resolveMcqAnswer(answer: string, options: string[]): string | null {
+  if (options.includes(answer)) return answer;
+  const squash = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+  const exact = options.find((option) => squash(option) === squash(answer));
+  if (exact) return exact;
+  // A bare letter, or a letter followed by ")", "." or ":" ("B) Dropout"); never a sentence like "A method…".
+  const letter = answer.trim().match(/^(?:option\s*)?\(?([a-d])\)?(?:[).:]|$)/i);
+  if (letter) {
+    const index = letter[1].toLowerCase().charCodeAt(0) - 97;
+    if (index < options.length) return options[index];
+  }
+  const number = answer.trim().match(/^(?:option\s*)?([1-4])(?:[).:]|$)/i);
+  if (number) {
+    const index = Number(number[1]) - 1;
+    if (index < options.length) return options[index];
+  }
+  return null;
+}
+
+function normalizeType(value: unknown): QuizQuestionType | null {
+  const key = String(value ?? "").toLowerCase().replace(/[\s/-]+/g, "_");
+  if (key === "mcq" || key === "multiple_choice" || key === "multiplechoice") return "mcq";
+  if (key === "true_false" || key === "truefalse" || key === "tf" || key === "boolean") return "true_false";
+  if (key === "short_answer" || key === "shortanswer" || key === "short" || key === "open") return "short_answer";
+  return null;
+}
+
+/** Turn loose model output into UI-ready questions. A question whose answer cannot be matched
+ *  to one of its options is dropped, never "repaired" into a wrong key. */
+export function sanitizeQuestions(input: unknown[]): QuizQuestion[] {
+  const out: QuizQuestion[] = [];
+  input.forEach((q) => {
+    if (!q || typeof q !== "object") return;
+    const r = q as Record<string, unknown>;
+    const type = normalizeType(r.type);
+    const question = String(r.question ?? "").trim();
+    const answer = String(r.answer ?? "").trim();
+    if (!type || !question || !answer) return;
+    const extra = {
+      explanation: String(r.explanation ?? "").trim() || undefined,
+      source: String(r.source ?? "").trim() || undefined,
+    };
+    if (type === "mcq") {
+      const raw = Array.isArray(r.options) ? (r.options as unknown[]).map((o) => String(o).trim()).filter(Boolean) : [];
+      // Duplicates would make two buttons for one answer (and collide as React keys).
+      const options = [...new Set(raw)].slice(0, 4);
+      if (options.length < 2) return;
+      const resolved = resolveMcqAnswer(answer, options);
+      if (!resolved) return;
+      out.push({ id: "", type: "mcq", question, options, answer: resolved, ...extra });
+    } else if (type === "true_false") {
+      const norm = normalizeTrueFalse(answer);
+      if (!norm) return;
+      out.push({ id: "", type: "true_false", question, options: ["True", "False"], answer: norm, ...extra });
+    } else {
+      out.push({ id: "", type: "short_answer", question, answer, ...extra });
+    }
+  });
+  // Re-id sequentially so UI keys are stable.
+  return out.map((q, i) => ({ ...q, id: `q${i + 1}` }));
+}
+
+// ── Public API ────────────────────────────────────────────────
+
+function hermesRequestFailed(status: number, detail: string): QuizAIError {
+  if (status === 401)
+    return new QuizAIError(
+      "Hermes rejected the gateway key (401). Press Apply in footer Settings to save this tab's key to the server, or clear it to use the server key.",
+      status,
+      false,
+      "unauthorized",
+    );
+  if (status === 422) return new QuizAIError(detail || "Invalid quiz request.", status, false, detail ? undefined : "invalidRequest");
+  if (status === 502 || status === 503 || status === 504)
+    return new QuizAIError(
+      detail || "Hermes is unavailable or timed out — transient, retry in a bit.",
+      status,
+      true,
+      detail ? undefined : "unavailable",
+    );
+  return new QuizAIError(
+    detail || `Quiz request failed (${status}).`,
+    status,
+    undefined,
+    detail ? undefined : "requestFailed",
+    { status },
+  );
+}
+
+/**
+ * Time-based progress for an opaque agent run: the gateway gives no
+ * byte stream, so percent ramps with elapsed time (capped), and the
+ * stage transitions are the honest signal. Parsed counts only update
+ * once the full output validates.
+ */
+function startRunTicker(options: QuizGenerationOptions): () => void {
+  const startedAt = Date.now();
+  const emit = (stage: QuizLiveStage) => {
+    const elapsed = (Date.now() - startedAt) / 1000;
+    const percent =
+      stage === "waiting" ? Math.min(8, 2 + elapsed) : Math.min(90, 10 + 80 * (1 - Math.exp(-elapsed / 60)));
+    options.onProgress?.({
+      percent: Math.round(percent),
+      stage,
+      charsReceived: 0,
+      parsedQuestions: 0,
+      totalQuestions: options.count,
+    });
+  };
+  emit("waiting");
+  const timer = window.setInterval(() => emit("receiving"), 1000);
+  return () => window.clearInterval(timer);
+}
+
+/**
+ * Generate quiz questions through the Waypoint backend (Hermes gateway).
+ * No provider key in the browser: the server runs the model chosen in Settings
+ * and descends its fallback ladder (same as the coach).
+ * Progress ticks while the agent run is polled; the shared
+ * parse/salvage pipeline then validates the output.
+ */
+export interface QuizGenerationResult {
+  questions: QuizQuestion[];
+  /** Model the backend actually used. */
+  model: string;
+  provider: string;
+}
+
+export async function generateQuiz(
+  sourceText: string,
+  options: QuizGenerationOptions,
+): Promise<QuizGenerationResult> {
+  if (!sourceText.trim()) throw new QuizAIError("No slide text to generate from.", undefined, undefined, "noSource");
+  if (options.types.length === 0) throw new QuizAIError("Select at least one question type.", undefined, undefined, "noTypes");
+
+  const source =
+    sourceText.length > MAX_SOURCE_CHARS ? sourceText.slice(0, MAX_SOURCE_CHARS) : sourceText;
+  const stopTicker = startRunTicker(options);
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/quiz/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source_text: source,
+        count: options.count,
+        difficulty: options.difficulty,
+        types: options.types,
+      }),
+      signal: options.signal,
+    });
+  } catch (e) {
+    stopTicker();
+    // User-cancelled — let it propagate so the UI can exit quietly.
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    const detail = e instanceof Error ? e.message : "network error";
+    throw new QuizAIError(
+      `Couldn't reach the Waypoint backend (${detail}). Is the stack running (run.bat or run.sh)?`,
+      undefined,
+      undefined,
+      "unreachable",
+      { detail },
+    );
+  }
+  if (!res.ok) {
+    stopTicker();
+    let detail = "";
+    try {
+      detail = formatErrorDetail(((await res.json()) as { detail?: unknown }).detail);
+    } catch {
+      // Non-JSON error body — fall back to the status mapping.
+    }
+    throw hermesRequestFailed(res.status, detail);
+  }
+  let payload: { output?: unknown; model?: unknown; provider?: unknown };
+  try {
+    payload = (await res.json()) as { output?: unknown; model?: unknown; provider?: unknown };
+  } catch {
+    stopTicker();
+    throw new QuizAIError("Backend returned an unreadable answer. Retry.", undefined, undefined, "unreadable");
+  }
+  stopTicker();
+  const output = payload.output;
+  if (typeof output !== "string" || !output.trim()) {
+    throw new QuizAIError("Backend returned an empty answer. Retry.", undefined, undefined, "empty");
+  }
+  options.onProgress?.({
+    percent: 96,
+    stage: "validating",
+    charsReceived: output.length,
+    parsedQuestions: 0,
+    totalQuestions: options.count,
+  });
+  const questions = parseQuizJson(output);
+  if (questions.length === 0) throw new QuizAIError("Model returned no valid questions. Retry.", undefined, undefined, "noQuestions");
+  options.onProgress?.({
+    percent: 100,
+    stage: "done",
+    charsReceived: output.length,
+    parsedQuestions: questions.length,
+    totalQuestions: options.count,
+  });
+  return {
+    questions,
+    model: typeof payload.model === "string" ? payload.model : "",
+    provider: typeof payload.provider === "string" ? payload.provider : "",
+  };
+}
+
+/** Offline demo set so the UI is testable without a key. */
+export function getMockQuiz(): QuizQuestion[] {
+  return [
+    {
+      id: "q1",
+      type: "mcq",
+      question: "Which practice helps a model generalize to unseen data?",
+      options: ["Memorizing the training set", "Regularization + validation split", "Removing all dropout", "Training on test data"],
+      answer: "Regularization + validation split",
+      explanation: "Regularization constrains the model while a held-out split measures generalization.",
+      source: "Demo",
+    },
+    {
+      id: "q2",
+      type: "true_false",
+      question: "A confusion matrix can reveal class-specific errors that accuracy hides.",
+      options: ["True", "False"],
+      answer: "True",
+      explanation: "Per-class precision/recall expose imbalances that top-line accuracy masks.",
+      source: "Demo",
+    },
+    {
+      id: "q3",
+      type: "short_answer",
+      question: "In one sentence, what does a learning-rate schedule control?",
+      answer: "How the optimizer step size changes over training to balance speed and stability.",
+      explanation: "Large early steps explore fast; decayed steps settle into minima.",
+      source: "Demo",
+    },
+  ];
+}
